@@ -1,15 +1,32 @@
-# saule-engine-lib
+# Shine2D
 
-A small Love2D-style graphics engine compiled as a Saule **native package**,
-and the reference consumer of `saule-sdk`.
+A Love2D-style 2D game engine for the [Saule](https://github.com/lauriszz123/saule)
+language, and the reference consumer of `saule-sdk`.
 
-This crate is **not** linked into the toolchain. It builds as a `cdylib`
-(`saule_engine_lib.so` / `.dll` / `.dylib`) and is dropped into
-`~/.saule/native_packages/`. That file is the whole package: its classes,
-signatures and doc comments are compiled into it, and `saule` reads them out
-of the file before it ever loads it.
+```lua
+import * from "shine"
 
-All ABI plumbing is handled by `saule-sdk`: each module exposes plain safe
+Window.create(800, 600, "hello")
+while Window.isOpen() do
+    Window.pollEvents()
+    local dt: float = Timer.getDelta()
+    Graphics.clear(0.1, 0.1, 0.12)
+    Graphics.setColor(1.0, 0.8, 0.2)
+    Graphics.circle("fill", 400.0, 300.0, 32.0)
+    Graphics.present()
+end
+```
+
+Nothing here is linked into the Saule toolchain. This crate builds as a
+`cdylib` (`saule_shine.so` / `.dll` / `.dylib`) that you drop into
+`~/.saule/native_packages/`. **That one file is the whole package**: its
+classes, every signature and every doc comment are compiled into the library,
+and Saule reads them out of the file *without loading it* — so a program that
+imports `shine` type-checks, completes and shows documentation in the editor
+before a line of this code runs. There is no manifest to generate or keep in
+sync.
+
+All the ABI plumbing is handled by `saule-sdk`: each module exposes plain safe
 functions annotated with `#[saule_export]`, and the package is declared with
 `saule_package!`.
 
@@ -402,14 +419,52 @@ stretching it would spread a short final line edge to edge.
 ## Building & installing
 
 ```sh
-cargo build -p saule-engine-lib --release
+cargo build --release
 ```
 
-Then install with the script for your platform — `scripts\install_windows.ps1`,
-`scripts/install_wsl.sh` or `scripts/install_mac.sh` — or copy the library into
-`~/.saule/native_packages/` yourself. There is nothing else to install and
-nothing to regenerate after changing a `#[saule_export]` signature: the
-package's description is compiled from the same declarations as its code, so
-the two cannot drift.
+Then copy the library into your Saule home — the file name does not matter,
+Saule reads the package's real name out of it:
 
-See `examples/native-package/` for `.sau` programs that import this package.
+```sh
+# Linux
+cp target/release/libsaule_shine.so    ~/.saule/native_packages/
+# macOS
+cp target/release/libsaule_shine.dylib ~/.saule/native_packages/
+# Windows (PowerShell)
+copy target\release\saule_shine.dll $env:USERPROFILE\.saule\native_packages\
+```
+
+That is the whole install. Nothing needs regenerating after you change a
+`#[saule_export]` signature: the package's description is compiled from the
+same declarations as its code, so the two cannot drift.
+
+### macOS: one extra step
+
+Apple's linker (`ld-27037.1`, Xcode 26) sometimes leaves a release build's
+symbol string table 4-byte aligned, and macOS 27's dyld then refuses to load
+the library at all:
+
+```
+mis-aligned LINKEDIT string pool, fileOffset=0x000FAEE4
+```
+
+It is a linker bug, not anything about this code — it happens when the indirect
+symbol table has an odd number of entries, so whether a build is affected
+changes with any edit. Repair the library after building it with
+[`scripts/align_macho_strtab.py`](https://github.com/lauriszz123/saule/blob/develop/scripts/align_macho_strtab.py)
+from the Saule repository:
+
+```sh
+python3 align_macho_strtab.py target/release/libsaule_shine.dylib
+```
+
+It pads the string table, re-signs ad-hoc, and does nothing to a library that
+came out aligned, so it is safe to run every time. Saule says so explicitly if
+you install one that still needs it.
+
+## Toolchain compatibility
+
+The native ABI version is checked when the library loads, so a build made
+against one Saule toolchain is refused by a mismatched one, with both versions
+named. `Cargo.toml` tracks the Saule repository's `develop` branch while the
+SDK is unpublished; pin a tag there before cutting a release.

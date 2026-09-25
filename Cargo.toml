@@ -1,22 +1,37 @@
 [package]
-name = "saule-engine-lib"
-version.workspace = true
-edition.workspace = true
-description = "Love2D-like graphics engine, compiled as a dynamically-loadable Saule native package."
-license.workspace = true
+name = "saule-shine"
+version = "0.1.0"
+edition = "2024"
+description = "Shine2D — a Love2D-like 2D game engine for the Saule language, built as a native package."
+license = "MIT"
+repository = "https://github.com/lauriszz123/saule-shine"
+keywords = ["saule", "gamedev", "graphics", "2d"]
+categories = ["game-engines", "graphics"]
 
 [lib]
-name = "saule_engine_lib"
-# `cdylib` produces the `.so` / `.dll` / `.dylib` the Saule interpreter loads
-# at runtime. `rlib` lets the crate's own tests link against it normally.
+name = "saule_shine"
+# `cdylib` produces the `.so` / `.dll` / `.dylib` Saule loads at runtime.
+# `rlib` lets this crate's own tests link against it normally.
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
+
+# This crate is its own workspace root, so it carries the settings the Saule
+# workspace used to provide. Fat LTO and a single codegen unit are worth the
+# build time for a renderer whose inner loops cross module boundaries.
+[profile.release]
+lto = "fat"
+codegen-units = 1
 
 [dependencies]
 # The SDK does the ABI heavy lifting: `#[saule_export]` generates the C shim,
 # infers the Saule signature and compiles it into the library, and
 # `saule_package!` declares the package. Authors write only safe Rust.
-saule-sdk = { path = "../saule-sdk" }
+#
+# From git until the SDK is published to crates.io, at which point this becomes
+# a plain version requirement. Pin a tag rather than a branch before releasing:
+# the native ABI version is checked at load, so the toolchain a package is built
+# against is part of what it ships.
+saule-sdk = { git = "https://github.com/lauriszz123/saule", branch = "develop" }
 # X11-only on Linux: WSLg's Wayland compositor (Weston) lacks server-side
 # window decorations, so minifb's Wayland backend fails to map a visible
 # window ("Failed to create server-side surface decoration: Missing").

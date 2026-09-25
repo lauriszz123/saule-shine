@@ -1,11 +1,28 @@
-//! `saule-engine-lib` — a Love2D-like graphics engine compiled as a Saule
+//! **Shine2D** — a Love2D-like 2D game engine for the
+//! [Saule](https://github.com/lauriszz123/saule) language, built as a Saule
 //! *native package*, and the reference consumer of [`saule_sdk`].
 //!
-//! This crate is **not** linked into the interpreter. It is built as a
-//! `cdylib` (`saule_engine_lib.dll` / `.so` / `.dylib`) and dropped into
-//! `~/.saule/native_packages/`. That one file is the whole package: its
-//! classes, every method's signature and doc comment are compiled into it,
-//! and the interpreter reads them out of the file before it ever loads it.
+//! Saule programs reach it as `shine`:
+//!
+//! ```text
+//! import * from "shine"
+//!
+//! Window.create(800, 600)
+//! while Window.isOpen() do
+//!     Window.pollEvents()
+//!     Graphics.clear(0.1, 0.1, 0.12)
+//!     Graphics.circle("fill", 400.0, 300.0, 32.0)
+//!     Graphics.present()
+//! end
+//! ```
+//!
+//! Nothing here is linked into the interpreter. The crate builds as a
+//! `cdylib` (`saule_shine.dll` / `libsaule_shine.so` / `.dylib`) that is
+//! dropped into `~/.saule/native_packages/`. That one file is the whole
+//! package: its classes, every method's signature and doc comment are
+//! compiled into it, and Saule reads them out of the file before it ever
+//! loads it — so a program that imports it type-checks, completes and
+//! documents in the editor before any of this code runs.
 //!
 //! All of that — the `extern "C"` shims, argument decoding, error
 //! marshalling, signatures and metadata — is handled by [`saule_sdk`]. Each
@@ -16,10 +33,13 @@
 //! ## Building
 //!
 //! ```text
-//! cargo build -p saule-engine-lib --release
-//! # then copy target/release/(lib)saule_engine_lib.{so,dylib,dll}
-//! # into ~/.saule/native_packages/ — or run scripts/install_*.
+//! cargo build --release
+//! # then copy target/release/(lib)saule_shine.{so,dylib,dll}
+//! # into ~/.saule/native_packages/
 //! ```
+//!
+//! See the README for the macOS caveat: Apple's linker can leave a release
+//! build's string pool misaligned, and macOS then refuses to load it.
 
 mod clipboard;
 mod event;
@@ -36,9 +56,9 @@ mod timer;
 mod window;
 
 saule_sdk::saule_package! {
-    name = "engine",
+    name = "shine",
     version = "0.1.0",
-    doc = "A Love2D-like 2D engine: a window, shapes, text, images and input.",
+    doc = "Shine2D — a Love2D-like 2D engine: a window, shapes, text, images and input.",
     classes {
         Graphics = "2D graphics: shapes, text, canvases, clipping, and transforms.",
         Keyboard = "Keyboard input: key state, per-frame press/release edges, and typed text.",

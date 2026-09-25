@@ -1,0 +1,7 @@
+/target
+.DS_Store
+
+# Cargo.lock is committed on purpose: this crate is an end product people build
+# and install, not a library other crates depend on, so a reproducible build is
+# worth more than resolving fresh. It pins the SDK to a commit of the Saule
+# repository's `develop` branch — `cargo update -p saule-sdk` moves it.
