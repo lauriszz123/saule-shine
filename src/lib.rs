@@ -41,14 +41,20 @@
 //! See the README for the macOS caveat: Apple's linker can leave a release
 //! build's string pool misaligned, and macOS then refuses to load it.
 
+mod audio;
+mod batch;
 mod clipboard;
 mod event;
+mod events;
 mod font;
 mod geom;
 mod graphics;
 mod image;
 mod keyboard;
 mod mouse;
+mod objects;
+mod particles;
+mod random;
 mod raster;
 mod render;
 mod state;
@@ -58,7 +64,7 @@ mod window;
 saule_sdk::saule_package! {
     name = "shine",
     version = "0.1.0",
-    doc = "Shine2D — a Love2D-like 2D engine: a window, shapes, text, images and input.",
+    doc = "Shine2D — a Love2D-like 2D engine: a window, shapes, text, images, sprite batches, particles, sound and input.",
     classes {
         Graphics = "2D graphics: shapes, text, canvases, clipping, and transforms.",
         Keyboard = "Keyboard input: key state, per-frame press/release edges, and typed text.",
@@ -66,6 +72,8 @@ saule_sdk::saule_package! {
         Window = "Window management.",
         Timer = "Timing helpers.",
         Clipboard = "System clipboard: copy and paste plain text.",
+        Random = "Seedable random numbers and Perlin noise — Love2D's `love.math`.",
+        Audio = "Sound: load or synthesise sources and play them — Love2D's `love.audio`.",
     }
 }
 

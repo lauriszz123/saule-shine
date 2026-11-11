@@ -92,6 +92,29 @@ fn timer_get_delta() -> f64 {
     })
 }
 
+/// `Timer.step()` — measure the time since the previous step and return it:
+/// the frame's `dt`, as `love.timer.step` does at the top of `love.run`.
+///
+/// It advances the same clock `getDelta` does, so a loop calls one of the
+/// two per frame, not both.
+#[saule_export(class = "Timer", name = "step")]
+fn timer_step() -> f64 {
+    timer_get_delta()
+}
+
+/// `Timer.getAverageDelta()` — the mean time between presented frames over
+/// the last 30, in seconds; `0.0` until two frames have been presented.
+#[saule_export(class = "Timer", name = "getAverageDelta")]
+fn timer_get_average_delta() -> f64 {
+    with_clock(|c| {
+        if c.intervals.is_empty() {
+            return 0.0;
+        }
+        let total: Duration = c.intervals.iter().sum();
+        total.as_secs_f64() / c.intervals.len() as f64
+    })
+}
+
 /// `Timer.getFPS()` — frames actually presented per second, averaged over the
 /// last 30 frames. `0.0` until two frames have been presented.
 #[saule_export(class = "Timer", name = "getFPS")]

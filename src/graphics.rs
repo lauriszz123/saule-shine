@@ -9,8 +9,10 @@
 //!
 //! ## Differences from Love2D worth knowing
 //!
-//! - Drawables are **integer handles**, not objects: `newCanvas` and `newFont`
-//!   return a handle you pass back to `draw`, `setCanvas`, and `setFont`.
+//! - Drawables are objects, as in Love2D — `Image`, `Canvas`, `Font`, `Quad`,
+//!   `SpriteBatch`, `ParticleSystem` — defined in `objects.rs`, `batch.rs`
+//!   and `particles.rs`. Saule has no overloading, so `draw(texture, quad, …)`
+//!   is `drawq`, Love2D 0.8's name for it.
 //! - `newFont(size, path?)` takes the size first, so `newFont(24)` gives you
 //!   the system UI face at 24px with no file to ship.
 //! - Point lists (`polygon`, `polyline`, `points`) take a flat table of
@@ -24,7 +26,7 @@ use saule_sdk::prelude::*;
 use saule_sdk::saule_export;
 
 use crate::geom::Point;
-use crate::raster::{Gradient, GradientKind, Rect, Stop};
+use crate::raster::{Gradient, GradientKind, Stop};
 use crate::state;
 
 // ---------------------------------------------------------------------------
@@ -86,7 +88,10 @@ fn graphics_clear(
 /// iteration.
 #[saule_export(class = "Graphics", name = "present")]
 fn graphics_present() -> Result<(), String> {
-    state::with(|e| e.present())??;
+    state::with(|e| {
+        state::flush_releases(&mut e.r);
+        e.present()
+    })??;
     Ok(())
 }
 
@@ -220,40 +225,6 @@ fn graphics_printf(
     let align = align.unwrap_or_else(|| "left".to_string());
     state::draw(|gfx| gfx.printf(&text, x, y, limit, &align))?
         .map_err(|e| format!("Graphics.printf: {e}"))
-}
-
-/// `Graphics.newFont(size [, path])` — load a TrueType face at a point size.
-/// Without a path you get the host's UI typeface, so text works with no assets
-/// to ship. Returns a font handle for `setFont`.
-#[saule_export(class = "Graphics", name = "newFont")]
-fn graphics_new_font(size: f64, path: Option<String>) -> Result<i64, String> {
-    state::draw(|gfx| gfx.new_font(size, path.as_deref()))?
-        .map_err(|e| format!("Graphics.newFont: {e}"))
-}
-
-/// `Graphics.setNewFont(size [, path])` — `newFont` followed by `setFont`.
-#[saule_export(class = "Graphics", name = "setNewFont")]
-fn graphics_set_new_font(size: f64, path: Option<String>) -> Result<i64, String> {
-    state::draw(|gfx| -> Result<i64, String> {
-        let handle = gfx.new_font(size, path.as_deref())?;
-        gfx.set_font(handle)?;
-        Ok(handle)
-    })?
-    .map_err(|e| format!("Graphics.setNewFont: {e}"))
-}
-
-/// `Graphics.setFont(handle)` — select a loaded font. Handle `0` is the
-/// default face.
-#[saule_export(class = "Graphics", name = "setFont")]
-fn graphics_set_font(handle: i64) -> Result<(), String> {
-    state::draw(|gfx| gfx.set_font(handle))??;
-    Ok(())
-}
-
-/// `Graphics.getFont()` — the active font handle.
-#[saule_export(class = "Graphics", name = "getFont")]
-fn graphics_get_font() -> Result<i64, String> {
-    state::draw(|gfx| gfx.get_font())
 }
 
 /// `Graphics.getFontHeight()` — baseline-to-baseline line height, the vertical
@@ -422,115 +393,6 @@ fn graphics_get_scissor() -> Result<(f64, f64, f64, f64), String> {
 // ---------------------------------------------------------------------------
 // Canvases
 // ---------------------------------------------------------------------------
-
-/// `Graphics.newCanvas(width, height)` — an offscreen ARGB surface. Returns a
-/// canvas handle.
-#[saule_export(class = "Graphics", name = "newCanvas")]
-fn graphics_new_canvas(width: i64, height: i64) -> Result<i64, String> {
-    state::draw(|gfx| gfx.new_canvas(width, height))?
-}
-
-/// `Graphics.setCanvas([handle])` — route subsequent draws into a canvas; no
-/// argument (or `0`) restores the screen.
-#[saule_export(class = "Graphics", name = "setCanvas")]
-fn graphics_set_canvas(handle: Option<i64>) -> Result<(), String> {
-    state::draw(|gfx| gfx.set_canvas(handle))??;
-    Ok(())
-}
-
-/// `Graphics.getCanvas()` — the bound canvas handle, or `0` for the screen.
-#[saule_export(class = "Graphics", name = "getCanvas")]
-fn graphics_get_canvas() -> Result<i64, String> {
-    state::draw(|gfx| gfx.get_canvas())
-}
-
-/// `Graphics.draw(canvas, x, y [, angle, sx, sy, ox, oy])` — composite a canvas
-/// onto the current target, tinted by the current colour.
-// The arity is the language-level `Graphics.draw` signature, which mirrors
-// LÖVE's; grouping the transform args into a struct here would only change
-// the Rust side of a shape the Saule API already fixes.
-#[allow(clippy::too_many_arguments)]
-#[saule_export(class = "Graphics", name = "draw")]
-fn graphics_draw(
-    canvas: i64,
-    x: f64,
-    y: f64,
-    angle: Option<f64>,
-    sx: Option<f64>,
-    sy: Option<f64>,
-    ox: Option<f64>,
-    oy: Option<f64>,
-) -> Result<(), String> {
-    let sx = sx.unwrap_or(1.0);
-    state::draw(|gfx| {
-        gfx.draw_canvas(
-            canvas,
-            x,
-            y,
-            angle.unwrap_or(0.0),
-            sx,
-            sy.unwrap_or(sx),
-            ox.unwrap_or(0.0),
-            oy.unwrap_or(0.0),
-        )
-    })??;
-    Ok(())
-}
-
-/// `Graphics.newImage(path)` — load a PNG from disk. Returns a handle usable
-/// anywhere a canvas handle is: `draw`, `drawFrame`, `imageSize`, `setCanvas`.
-///
-/// Decoding is not cached, so load an image once at startup rather than every
-/// frame.
-#[saule_export(class = "Graphics", name = "newImage")]
-fn graphics_new_image(path: String) -> Result<i64, String> {
-    state::draw(|gfx| gfx.new_image(&path))?
-}
-
-/// `Graphics.imageSize(handle)` — pixel dimensions of an image or canvas, as
-/// `width, height`.
-#[saule_export(class = "Graphics", name = "imageSize")]
-fn graphics_image_size(handle: i64) -> Result<(i64, i64), String> {
-    state::draw(|gfx| gfx.image_size(handle))?
-}
-
-/// `Graphics.drawFrame(image, fx, fy, fw, fh, x, y [, angle, sx, sy, ox, oy])`
-/// — composite one cell of an image, for spritesheets. `fx, fy, fw, fh` is the
-/// source rectangle in image pixels; the rest positions it exactly like
-/// `draw`. Sampling is confined to the cell, so neighbouring frames never
-/// bleed in at the edges.
-#[saule_export(class = "Graphics", name = "drawFrame")]
-#[allow(clippy::too_many_arguments)]
-fn graphics_draw_frame(
-    image: i64,
-    fx: f64,
-    fy: f64,
-    fw: f64,
-    fh: f64,
-    x: f64,
-    y: f64,
-    angle: Option<f64>,
-    sx: Option<f64>,
-    sy: Option<f64>,
-    ox: Option<f64>,
-    oy: Option<f64>,
-) -> Result<(), String> {
-    let sx = sx.unwrap_or(1.0);
-    state::draw(|gfx| {
-        gfx.draw_frame(
-            image,
-            Rect::new(fx, fy, fw, fh),
-            x,
-            y,
-            angle.unwrap_or(0.0),
-            sx,
-            sy.unwrap_or(sx),
-            ox.unwrap_or(0.0),
-            oy.unwrap_or(0.0),
-        )
-    })??;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Coordinate system
@@ -702,30 +564,6 @@ fn graphics_get_pixel_dimensions() -> Result<(i64, i64), String> {
 // Resource lifetime
 // ---------------------------------------------------------------------------
 
-/// `Graphics.release(handle)` — free a canvas or image and its pixels.
-///
-/// Canvases and images used to live for the whole process: the registry only
-/// ever grew, so a view that reallocated its canvas on every resize leaked the
-/// old one, and dropping an image cache freed the handles but not the memory
-/// behind them. Releasing is explicit rather than automatic because the engine
-/// cannot see how many Saule values still hold the handle.
-///
-/// A released handle is not reused: a later `draw` with it reports an error
-/// rather than silently addressing whatever has since taken the slot.
-#[saule_export(class = "Graphics", name = "release")]
-fn graphics_release(handle: i64) -> Result<(), String> {
-    state::draw(|gfx| gfx.release_canvas(handle))?
-}
-
-/// `Graphics.releaseFont(handle)` — free a loaded font and its glyph cache.
-///
-/// Refused while the font is selected or held by a `push("all")` state, since
-/// either would leave a live reference to a freed slot.
-#[saule_export(class = "Graphics", name = "releaseFont")]
-fn graphics_release_font(handle: i64) -> Result<(), String> {
-    state::draw(|gfx| gfx.release_font(handle))?
-}
-
 /// `Graphics.getStats()` — live canvases, live fonts, and the bytes their
 /// pixels occupy, as three values.
 ///
@@ -742,45 +580,6 @@ fn graphics_get_stats() -> Result<(i64, i64, i64), String> {
 // ---------------------------------------------------------------------------
 // Fallible loading
 // ---------------------------------------------------------------------------
-
-/// `Graphics.loadImage(path)` — `newImage` that reports failure as `nil`.
-///
-/// A native error ends the program, so code that wants to skip a missing asset
-/// had to `Io.open` the file first purely to find out whether it exists — two
-/// opens, and still a race against anything that removes it in between. This
-/// returns the handle or `nil`, with no probe and no race.
-#[saule_export(class = "Graphics", name = "loadImage")]
-fn graphics_load_image(path: String) -> Result<Option<i64>, String> {
-    state::draw(|gfx| gfx.try_new_image(&path))
-}
-
-/// `Graphics.loadFont(size [, path])` — `newFont` that reports failure as
-/// `nil`, so a missing typeface can fall back to the default face instead of
-/// ending the program.
-#[saule_export(class = "Graphics", name = "loadFont")]
-fn graphics_load_font(size: f64, path: Option<String>) -> Result<Option<i64>, String> {
-    state::draw(|gfx| gfx.try_new_font(size, path.as_deref()))
-}
-
-/// `Graphics.newImageFromBase64(data)` — decode a base64-encoded PNG.
-///
-/// The native ABI carries strings as UTF-8, so raw PNG bytes cannot cross it;
-/// base64 is what lets an asset be embedded in a `.sau` source file, or arrive
-/// over a network, without a temporary file on the way in.
-#[saule_export(class = "Graphics", name = "newImageFromBase64")]
-fn graphics_new_image_from_base64(data: String) -> Result<i64, String> {
-    state::draw(|gfx| gfx.new_image_from_base64(&data))?
-}
-
-/// `Graphics.saveImage(handle, path)` — write a canvas, image, or the screen
-/// (handle `0`) to `path` as a PNG.
-///
-/// The screenshot, and the thing that makes a rendering regression testable:
-/// draw a frame, save it, compare it against a reference.
-#[saule_export(class = "Graphics", name = "saveImage")]
-fn graphics_save_image(handle: i64, path: String) -> Result<(), String> {
-    state::draw(|gfx| gfx.save_image(handle, &path))?
-}
 
 // ---------------------------------------------------------------------------
 // Gradients

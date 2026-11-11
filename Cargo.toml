@@ -57,6 +57,11 @@ png = "0.17"
 # dragging in C libraries.
 arboard = { version = "3.6.1", default-features = false }
 
+# Sound for `Audio.*`: device output through cpal (ALSA on Linux, so building
+# needs the ALSA development headers), and WAV and Ogg Vorbis decoding in pure
+# Rust.
+rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis"] }
+
 [target.'cfg(windows)'.dependencies]
 # Per-monitor DPI awareness, and the scale factor for the window. minifb has no
 # DPI query of its own, so this asks the OS through the native window handle.

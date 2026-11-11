@@ -37,3 +37,22 @@ pub(crate) fn mouse_set_cursor(style: String) -> Result<(), String> {
 pub(crate) fn mouse_set_visible(visible: bool) -> Result<(), String> {
     state::with(|e| e.set_cursor_visible(visible))
 }
+
+/// `Mouse.getPosition()` — `local x, y = Mouse.getPosition()`. Love2D's
+/// name for `getPos`.
+#[saule_export(class = "Mouse", name = "getPosition")]
+fn mouse_get_position() -> Result<(f64, f64), String> {
+    mouse_get_pos()
+}
+
+/// `Mouse.getX()` — the pointer's x in window pixels.
+#[saule_export(class = "Mouse", name = "getX")]
+fn mouse_get_x() -> Result<f64, String> {
+    Ok(mouse_get_pos()?.0)
+}
+
+/// `Mouse.getY()` — the pointer's y in window pixels.
+#[saule_export(class = "Mouse", name = "getY")]
+fn mouse_get_y() -> Result<f64, String> {
+    Ok(mouse_get_pos()?.1)
+}

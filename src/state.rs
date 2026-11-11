@@ -118,6 +118,10 @@ pub fn create(width: i64, height: i64, title: &str, resizable: bool) -> Result<(
     let buffer_w = (width as f64 * backing).round() as usize;
     let buffer_h = (height as f64 * backing).round() as usize;
 
+    // Objects bound to the previous window name its registries, not this one.
+    crate::objects::reset_bindings();
+    PENDING.with(|p| p.borrow_mut().clear());
+
     ENGINE.with(|cell| {
         *cell.borrow_mut() = Some(Engine {
             window,
@@ -137,6 +141,53 @@ pub fn create(width: i64, height: i64, title: &str, resizable: bool) -> Result<(
         });
     });
     Ok(())
+}
+
+/// A resource whose last Saule reference is gone, waiting to be freed.
+#[derive(Clone, Copy)]
+pub(crate) enum Res {
+    Surface(i64),
+    Font(i64),
+}
+
+thread_local! {
+    /// Releases deferred to the next frame. An object's `Drop` can run while
+    /// the engine is borrowed — inside a draw call that dropped the last
+    /// reference — or while the resource is still bound (the current canvas,
+    /// the selected font), so it queues here instead of freeing on the spot.
+    static PENDING: RefCell<Vec<Res>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Queue `res` to be freed at the next `Graphics.present`.
+pub(crate) fn release_later(res: Res) {
+    // `try_with`: a drop during thread teardown has nothing left to free into.
+    let _ = PENDING.try_with(|p| p.borrow_mut().push(res));
+}
+
+/// Free what [`release_later`] queued. A resource still in use — bound as
+/// the target, selected, held by a `push("all")` — stays queued for the next
+/// frame; one that no longer resolves (a previous window's) is dropped.
+pub(crate) fn flush_releases(r: &mut Renderer) {
+    let queued = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    if queued.is_empty() {
+        return;
+    }
+    let mut keep = Vec::new();
+    for res in queued {
+        let outcome = match res {
+            Res::Surface(h) => r.release_canvas(h),
+            Res::Font(h) => r.release_font(h),
+        };
+        if let Err(e) = outcome
+            && (e.contains("current render target")
+                || e.contains("on loan")
+                || e.contains("currently selected")
+                || e.contains("Graphics.push"))
+        {
+            keep.push(res);
+        }
+    }
+    PENDING.with(|p| p.borrow_mut().extend(keep));
 }
 
 /// Tear the window down (closes it on drop).

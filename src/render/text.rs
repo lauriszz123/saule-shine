@@ -33,14 +33,6 @@ impl Renderer {
         Ok(())
     }
 
-    /// The selected font's handle, or `0` for the default face.
-    pub fn get_font(&self) -> i64 {
-        match self.st.font {
-            0 => 0,
-            i => pack_handle(self.fonts[i].tag, i),
-        }
-    }
-
     /// Make sure the selected font slot is populated, loading the system
     /// default on first use.
     pub(crate) fn ensure_font(&mut self) -> Result<(), String> {
@@ -54,6 +46,26 @@ impl Renderer {
         self.fonts[0].value =
             Some(font::load_default(font::DEFAULT_SIZE).ok_or_else(no_system_font)?);
         Ok(())
+    }
+
+    /// Run `f` against the font `handle` names, loading the default face
+    /// first if that is the one asked for. The selection is untouched.
+    pub(crate) fn with_font<R>(
+        &mut self,
+        handle: i64,
+        f: impl FnOnce(&mut FontRes) -> R,
+    ) -> Result<R, String> {
+        let idx = self.font_index(handle, "Font")?;
+        let saved = self.st.font;
+        self.st.font = idx;
+        let loaded = self.ensure_font();
+        self.st.font = saved;
+        loaded?;
+        let font = self.fonts[idx]
+            .value
+            .as_mut()
+            .ok_or("Font: the font has been released")?;
+        Ok(f(font))
     }
 
     pub fn font_height(&mut self) -> Result<f64, String> {
