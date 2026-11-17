@@ -9,13 +9,20 @@ use crate::raster::{self, Gradient, Paint, Rect, Surface};
 ///
 /// Taking the fields rather than `&mut self` is what lets a draw call hold the
 /// scratch buffers and the target at the same time.
+///
+/// Every write to the screen comes through here, so this is also where the
+/// screen is marked changed — see [`Renderer::screen_dirty`].
 pub(crate) fn surface_of<'a>(
     screen: &'a mut Surface,
+    screen_dirty: &mut bool,
     canvases: &'a mut [Slot<Surface>],
     target: Option<usize>,
 ) -> &'a mut Surface {
     match target {
-        None => screen,
+        None => {
+            *screen_dirty = true;
+            screen
+        }
         Some(i) => canvases[i]
             .value
             .as_mut()
@@ -38,11 +45,12 @@ impl Renderer {
     pub(crate) fn target_mut(&mut self) -> &mut Surface {
         let Renderer {
             screen,
+            screen_dirty,
             canvases,
             target,
             ..
         } = self;
-        surface_of(screen, canvases, *target)
+        surface_of(screen, screen_dirty, canvases, *target)
     }
 
     /// The paint for the current state, with the scissor already reduced to the

@@ -164,6 +164,39 @@ fn a_resize_drops_a_clip_that_would_outlive_its_surface() {
 // Render targets
 // ---------------------------------------------------------------------------
 
+/// `present` only copies the framebuffer to the window when it changed, so
+/// every way of drawing on the screen has to mark it — and nothing else may.
+#[test]
+fn only_drawing_on_the_screen_marks_it_for_presenting() {
+    let mut r = renderer(8, 8);
+    r.screen_dirty = false;
+
+    // State changes and drawing into a canvas don't touch the screen.
+    let canvas = r.new_canvas(4, 4).expect("allocate");
+    opaque_red(&mut r);
+    r.set_canvas(Some(canvas)).expect("bind");
+    r.rectangle("fill", 0.0, 0.0, 4.0, 4.0, 0.0, 0.0)
+        .expect("fill");
+    r.set_canvas(None).expect("unbind");
+    assert!(!r.screen_dirty, "a canvas draw must not mark the screen");
+
+    // A shape on the screen does.
+    r.rectangle("fill", 0.0, 0.0, 2.0, 2.0, 0.0, 0.0)
+        .expect("fill");
+    assert!(r.screen_dirty, "a shape marks the screen");
+
+    // So does compositing a canvas onto it.
+    r.screen_dirty = false;
+    r.draw_canvas(canvas, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0)
+        .expect("draw");
+    assert!(r.screen_dirty, "a blit marks the screen");
+
+    // And a resize, whose fresh framebuffer has never been shown.
+    r.screen_dirty = false;
+    r.resize_screen(4, 4);
+    assert!(r.screen_dirty, "a new framebuffer needs presenting");
+}
+
 #[test]
 fn drawing_into_a_canvas_leaves_the_screen_alone() {
     let mut r = renderer(8, 8);

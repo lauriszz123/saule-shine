@@ -41,6 +41,12 @@ pub struct Engine {
     pub(crate) next_frame: Instant,
     /// Frame budget, or `None` when the loop runs unthrottled.
     pub(crate) frame_dur: Option<std::time::Duration>,
+    /// When the framebuffer was last copied to the window. An unchanged
+    /// frame is not copied again (see [`Engine::present`]), but it is
+    /// re-sent at least this often anyway, so a window the OS lost the
+    /// contents of — uncovered, restored, dragged to another monitor — is
+    /// repaired within moments even by an app that has stopped drawing.
+    pub(crate) last_blit: Instant,
     /// OS scale factor, refreshed each frame so dragging a window between
     /// monitors of different DPI is picked up.
     pub(crate) scale: f64,
@@ -129,6 +135,7 @@ pub fn create(width: i64, height: i64, title: &str, resizable: bool) -> Result<(
             keys: KeyState::default(),
             mouse: MouseState::default(),
             next_frame: Instant::now() + DEFAULT_FRAME_DUR,
+            last_blit: Instant::now(),
             frame_dur: Some(DEFAULT_FRAME_DUR),
             scale,
             events: Vec::new(),

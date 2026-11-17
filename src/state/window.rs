@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+/// How long an unchanged frame may go without being re-sent to the window.
+/// See [`Engine::present`].
+const FORCE_BLIT_EVERY: Duration = Duration::from_millis(500);
+
 /// Ask the OS for this window's scale factor, with 1.0 meaning "96 DPI".
 ///
 /// minifb has no DPI query, so this goes through the native window handle.
@@ -268,12 +272,29 @@ impl Engine {
     /// Present the framebuffer to the window, then sleep until the next frame
     /// deadline. This is the loop's single pacing point.
     pub fn present(&mut self) -> Result<(), String> {
+        // Copy the framebuffer to the window only when something was drawn
+        // to it. That copy is every pixel, every time — an `XPutImage` of the
+        // whole window, which under WSLg also crosses XWayland and the RDP
+        // compositor — and an app that skips repainting idle frames still
+        // presents each one to pace its loop. Re-sending an unchanged frame
+        // at 60 Hz is what made a large or maximised window crawl.
+        //
+        // An unchanged frame still pumps the event queue, which is the other
+        // half of what presenting is for.
+        let stale = self.last_blit.elapsed() >= FORCE_BLIT_EVERY;
+
         // Split the borrow so `update_with_buffer` can take `&mut window`
         // and `&buffer` at once.
         let Engine { window, r, .. } = self;
-        window
-            .update_with_buffer(&r.screen.buf, r.screen.w, r.screen.h)
-            .map_err(|e| format!("Graphics.present: {e}"))?;
+        if r.screen_dirty || stale {
+            window
+                .update_with_buffer(&r.screen.buf, r.screen.w, r.screen.h)
+                .map_err(|e| format!("Graphics.present: {e}"))?;
+            r.screen_dirty = false;
+            self.last_blit = Instant::now();
+        } else {
+            window.update();
+        }
 
         crate::timer::mark_frame();
 

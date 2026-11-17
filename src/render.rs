@@ -31,6 +31,16 @@ use crate::raster::Surface;
 pub struct Renderer {
     /// The window's framebuffer. minifb reads it as `0RGB` and ignores alpha.
     pub(crate) screen: Surface,
+    /// Whether `screen` has been drawn to since it was last presented.
+    ///
+    /// Presenting copies the whole framebuffer to the window — on X11 an
+    /// `XPutImage` of every pixel, which under WSLg is a trip through
+    /// XWayland and the RDP compositor. Doing that sixty times a second for a
+    /// frame that has not changed made a large or maximised window crawl,
+    /// because uikit (rightly) skips repainting idle frames but still
+    /// presents each one to pace its loop. Set by every write to the screen
+    /// (all of them go through `surface_of`), cleared by `present`.
+    pub(crate) screen_dirty: bool,
     /// Canvas and image registry. Handle `0` is the screen.
     pub(crate) canvases: Vec<Slot<Surface>>,
     /// Indices of released canvas slots, reused before the vector grows.
@@ -55,6 +65,7 @@ impl Renderer {
     pub fn new(width: usize, height: usize) -> Self {
         Renderer {
             screen: Surface::opaque(width, height),
+            screen_dirty: true,
             canvases: Vec::new(),
             free_canvases: Vec::new(),
             target: None,
@@ -82,6 +93,7 @@ impl Renderer {
     /// dropped at the same moment.
     pub(crate) fn resize_screen(&mut self, width: usize, height: usize) {
         self.screen = Surface::opaque(width, height);
+        self.screen_dirty = true;
         self.st.scissor = None;
     }
 }

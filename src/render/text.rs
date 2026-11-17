@@ -95,6 +95,7 @@ impl Renderer {
 
         let Renderer {
             screen,
+            screen_dirty,
             canvases,
             target,
             fonts,
@@ -102,7 +103,7 @@ impl Renderer {
             scratch,
             ..
         } = self;
-        let surf = surface_of(screen, canvases, *target);
+        let surf = surface_of(screen, screen_dirty, canvases, *target);
         let font = fonts[st.font]
             .value
             .as_mut()
@@ -143,6 +144,7 @@ impl Renderer {
 
         let Renderer {
             screen,
+            screen_dirty,
             canvases,
             target,
             fonts,
@@ -150,7 +152,7 @@ impl Renderer {
             scratch,
             ..
         } = self;
-        let surf = surface_of(screen, canvases, *target);
+        let surf = surface_of(screen, screen_dirty, canvases, *target);
         let font = fonts[st.font]
             .value
             .as_mut()

@@ -348,6 +348,7 @@ impl Renderer {
         // the two provably disjoint.
         let Renderer {
             screen,
+            screen_dirty,
             canvases,
             target,
             scratch,
@@ -373,7 +374,7 @@ impl Renderer {
             scratch.paths.push_slice(&scratch.device);
         }
 
-        let surf = surface_of(screen, canvases, *target);
+        let surf = surface_of(screen, screen_dirty, canvases, *target);
         raster::fill_paths_with(surf, scratch.paths.paths(), &paint, &mut scratch.fill);
         Ok(())
     }
@@ -486,6 +487,7 @@ impl Renderer {
 
         let Renderer {
             screen,
+            screen_dirty,
             canvases,
             target,
             scratch,
@@ -504,7 +506,7 @@ impl Renderer {
             ]);
         }
 
-        let surf = surface_of(screen, canvases, *target);
+        let surf = surface_of(screen, screen_dirty, canvases, *target);
         raster::fill_paths_with(surf, scratch.paths.paths(), &paint, &mut scratch.fill);
     }
 }
