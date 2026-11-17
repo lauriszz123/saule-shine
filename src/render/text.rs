@@ -203,6 +203,17 @@ pub(crate) fn draw_line(
     let baseline = y + font.ascent();
     font.layout_into(text, glyphs);
 
+    // On an unscaled target, start the line itself on a whole pixel, so the
+    // glyphs (snapped one by one below) keep the same spacing wherever the
+    // line is drawn — moving a label by 0.3px moves none of its letters
+    // rather than some of them.
+    let (x, baseline) = if is_unit(xform) {
+        let (dx, dy) = xform.apply(x, baseline);
+        (x + dx.round() - dx, baseline + dy.round() - dy)
+    } else {
+        (x, baseline)
+    };
+
     // Spaces seen so far, so each following glyph carries the justification
     // slack of every gap to its left.
     let mut spread = 0.0;
@@ -218,8 +229,36 @@ pub(crate) fn draw_line(
             continue; // whitespace carries advance but no pixels
         }
         let placement = Transform::translation(x + pen + spread + glyph.left, baseline + glyph.top);
-        raster::blit_mask(surf, &glyph.mask, &xform.then(&placement), paint);
+        raster::blit_mask(
+            surf,
+            &glyph.mask,
+            &snap_to_pixel(xform.then(&placement)),
+            paint,
+        );
     }
+}
+
+/// Move an unscaled, unrotated glyph placement onto whole pixels.
+///
+/// A glyph mask is rasterized on the pixel grid, so placing it at a
+/// fractional position gains nothing but blur — and costs a great deal: a
+/// fractional offset sends `blit_mask` down its general path, which inverts
+/// the transform and samples the mask bilinearly for every pixel. Advances
+/// are fractional, so that was nearly every glyph, and a 17-character label
+/// cost ~37 µs to draw. Snapped, the same label is a straight row-by-row
+/// blend. Scaled or rotated text keeps its exact transform.
+fn snap_to_pixel(mut t: Transform) -> Transform {
+    if is_unit(&t) {
+        t.tx = t.tx.round();
+        t.ty = t.ty.round();
+    }
+    t
+}
+
+/// No scale, rotation or shear: only a translation.
+fn is_unit(t: &Transform) -> bool {
+    const EPS: f64 = 1e-6;
+    (t.a - 1.0).abs() < EPS && (t.d - 1.0).abs() < EPS && t.b.abs() < EPS && t.c.abs() < EPS
 }
 
 pub(crate) fn no_system_font() -> String {

@@ -616,6 +616,28 @@ fn print_respects_the_scissor() {
     assert_eq!(r.written(), 0, "an empty clip must draw nothing");
 }
 
+/// Unscaled text lands on whole pixels: drawn at a fractional position it
+/// is the same image as at the rounded one, rather than a resampled blur —
+/// and it takes the fast row-by-row path to get there.
+#[test]
+fn unscaled_text_snaps_to_whole_pixels() {
+    let mut a = renderer(120, 40);
+    if a.ensure_font().is_err() {
+        return;
+    }
+    let mut b = renderer(120, 40);
+    b.ensure_font().expect("the same font loads twice");
+    for r in [&mut a, &mut b] {
+        r.set_color(1.0, 1.0, 1.0, 1.0);
+    }
+
+    a.print("Sprite", 4.3, 4.0).expect("print");
+    b.print("Sprite", 4.0, 4.0).expect("print");
+
+    assert!(a.written() > 0, "expected glyph coverage");
+    assert_eq!(a.screen.buf, b.screen.buf);
+}
+
 #[test]
 fn text_width_grows_with_the_text() {
     let mut r = renderer(8, 8);

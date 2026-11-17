@@ -1115,6 +1115,7 @@ dependencies = [
 [[package]]
 name = "saule-export-macro"
 version = "26.0.0"
+source = "git+https://github.com/lauriszz123/saule?branch=develop#460a4a0e1dc58d8a9ab54d440db15ecd049d54b0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1125,10 +1126,12 @@ dependencies = [
 [[package]]
 name = "saule-native-abi"
 version = "26.0.0"
+source = "git+https://github.com/lauriszz123/saule?branch=develop#460a4a0e1dc58d8a9ab54d440db15ecd049d54b0"
 
 [[package]]
 name = "saule-sdk"
 version = "26.0.0"
+source = "git+https://github.com/lauriszz123/saule?branch=develop#460a4a0e1dc58d8a9ab54d440db15ecd049d54b0"
 dependencies = [
  "saule-export-macro",
  "saule-native-abi",
@@ -1140,11 +1143,13 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "fontdue",
+ "libc",
  "minifb",
  "png",
  "rodio",
  "saule-sdk",
  "windows-sys 0.61.2",
+ "x11-dl",
 ]
 
 [[package]]

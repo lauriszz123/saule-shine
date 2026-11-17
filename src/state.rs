@@ -13,6 +13,8 @@
 //! not `Send`), and matches the actual call pattern exactly.
 
 mod input;
+#[cfg(target_os = "linux")]
+mod shm;
 mod window;
 
 pub(crate) use input::*;
@@ -29,6 +31,12 @@ use crate::render::Renderer;
 
 /// Live engine state, created by `Window.create`.
 pub struct Engine {
+    /// Presents frames through X11 shared memory instead of minifb's
+    /// `XPutImage` when the server allows it (see `state/shm.rs`). `None`
+    /// means minifb presents. Declared before `window` so it is dropped
+    /// first, while the window it draws into still exists.
+    #[cfg(target_os = "linux")]
+    pub(crate) shm: Option<shm::ShmPresenter>,
     pub(crate) window: Window,
     /// Render targets, graphics state, and resources.
     pub(crate) r: Renderer,
@@ -128,8 +136,28 @@ pub fn create(width: i64, height: i64, title: &str, resizable: bool) -> Result<(
     crate::objects::reset_bindings();
     PENDING.with(|p| p.borrow_mut().clear());
 
+    // `SHINE_NO_SHM=1` keeps minifb presenting, to rule shared memory out
+    // when chasing a display problem.
+    #[cfg(target_os = "linux")]
+    let shm = if std::env::var_os("SHINE_NO_SHM").is_some() {
+        None
+    } else {
+        shm::ShmPresenter::new(window.get_window_handle() as std::os::raw::c_ulong)
+    };
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SHINE_TRACE_PRESENT").is_some() {
+        let how = if shm.is_some() {
+            "X11 shared memory"
+        } else {
+            "minifb"
+        };
+        eprintln!("shine: presenting through {how}");
+    }
+
     ENGINE.with(|cell| {
         *cell.borrow_mut() = Some(Engine {
+            #[cfg(target_os = "linux")]
+            shm,
             window,
             r: Renderer::new(buffer_w, buffer_h),
             keys: KeyState::default(),

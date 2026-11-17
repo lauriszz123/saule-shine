@@ -283,17 +283,19 @@ impl Engine {
         // half of what presenting is for.
         let stale = self.last_blit.elapsed() >= FORCE_BLIT_EVERY;
 
-        // Split the borrow so `update_with_buffer` can take `&mut window`
-        // and `&buffer` at once.
-        let Engine { window, r, .. } = self;
-        if r.screen_dirty || stale {
-            window
-                .update_with_buffer(&r.screen.buf, r.screen.w, r.screen.h)
-                .map_err(|e| format!("Graphics.present: {e}"))?;
-            r.screen_dirty = false;
+        if self.r.screen_dirty || stale {
+            if !self.present_shared() {
+                // Split the borrow so `update_with_buffer` can take
+                // `&mut window` and `&buffer` at once.
+                let Engine { window, r, .. } = self;
+                window
+                    .update_with_buffer(&r.screen.buf, r.screen.w, r.screen.h)
+                    .map_err(|e| format!("Graphics.present: {e}"))?;
+            }
+            self.r.screen_dirty = false;
             self.last_blit = Instant::now();
         } else {
-            window.update();
+            self.window.update();
         }
 
         crate::timer::mark_frame();
@@ -323,5 +325,34 @@ impl Engine {
             self.next_frame = now + budget;
         }
         Ok(())
+    }
+}
+
+impl Engine {
+    /// Put the framebuffer on screen through shared memory, then pump the
+    /// window's events. `false` when that path is unavailable — never set
+    /// up, or found not to work, in which case it is dropped for good and
+    /// minifb presents from here on.
+    #[cfg(target_os = "linux")]
+    fn present_shared(&mut self) -> bool {
+        let Some(shm) = self.shm.as_mut() else {
+            return false;
+        };
+
+        if !shm.present(&self.r.screen.buf, self.r.screen.w, self.r.screen.h) {
+            if std::env::var_os("SHINE_TRACE_PRESENT").is_some() {
+                eprintln!("shine: shared memory failed, presenting through minifb");
+            }
+            self.shm = None;
+            return false;
+        }
+
+        self.window.update();
+        true
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn present_shared(&mut self) -> bool {
+        false
     }
 }
