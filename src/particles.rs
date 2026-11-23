@@ -51,7 +51,7 @@ struct Particle {
 
 /// A particle emitter. Without a texture each particle is a filled square
 /// `8 × size` pixels across; with one, the texture is drawn scaled by size.
-#[saule_class]
+#[saule_class(implements(Drawable))]
 pub struct ParticleSystem {
     texture: Option<(SAnyObject, i64, f64, f64)>,
     particles: Vec<Particle>,

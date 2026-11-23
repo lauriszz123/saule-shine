@@ -41,7 +41,7 @@ pub(crate) fn reset_bindings() {
 // ---------------------------------------------------------------------------
 
 /// A picture loaded from a PNG, drawn with `Graphics.draw(image, …)`.
-#[saule_class]
+#[saule_class(implements(Drawable))]
 pub struct Image {
     pub(crate) handle: i64,
     w: i64,
@@ -142,7 +142,7 @@ impl Image {
 
 /// An offscreen surface to draw into — bind it with `Graphics.setCanvas`, or
 /// fill it with `canvas.renderTo(fn)` — and then draw like an image.
-#[saule_class]
+#[saule_class(implements(Drawable))]
 pub struct Canvas {
     pub(crate) handle: i64,
     w: i64,
@@ -486,12 +486,13 @@ impl Place {
     }
 }
 
-/// `Graphics.draw(drawable [, x, y, r, sx, sy, ox, oy])` — draw an `Image`,
-/// `Canvas`, `SpriteBatch` or `ParticleSystem`, tinted by the current colour.
+/// `Graphics.draw(drawable [, x, y, r, sx, sy, ox, oy])` — draw anything
+/// `Drawable` (an `Image`, `Canvas`, `SpriteBatch` or `ParticleSystem`),
+/// tinted by the current colour.
 /// `r` is a rotation in radians, `sx, sy` a scale (`sy` defaults to `sx`),
 /// and `ox, oy` the origin within the drawable that lands on `x, y`.
 #[allow(clippy::too_many_arguments)]
-#[saule_export(class = "Graphics", name = "draw")]
+#[saule_export(class = "Graphics", name = "draw", sig(drawable = "Drawable"))]
 fn graphics_draw(
     drawable: SValue,
     x: Option<f64>,

@@ -22,7 +22,7 @@ struct Sprite {
 /// Many copies of one `Image` or `Canvas`, each placed, rotated, scaled,
 /// tinted and optionally cut by a `Quad`, drawn in one call with
 /// `Graphics.draw(batch)`.
-#[saule_class]
+#[saule_class(implements(Drawable))]
 pub struct SpriteBatch {
     /// Keeps the texture alive for as long as the batch is.
     _texture: SAnyObject,

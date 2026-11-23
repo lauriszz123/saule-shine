@@ -78,6 +78,9 @@ saule_sdk::saule_package! {
         Audio = "Sound: load or synthesise sources and play them — Love2D's `love.audio`.",
         Compositor = "For a display server: other Shine programs' windows, as images to draw and targets for input.",
     }
+    interfaces {
+        Drawable = "Anything `Graphics.draw` can draw: an `Image`, a `Canvas`, a `SpriteBatch` or a `ParticleSystem`.",
+    }
 }
 
 /// A global allocator that can be told to count allocations for a moment.

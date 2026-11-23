@@ -10,14 +10,17 @@
 //! this class only for the plumbing:
 //!
 //! ```saule
-//! Window.create(1024, 600, title: "wm")
+//! Window.create(title: "wm")
+//! local width, height = Window.getSize()     -- the real screen size
 //! Compositor.start()
 //! Os.spawn("/bin/apps/gamemaker")
 //!
 //! while Window.isOpen() do
 //!   for ev in Compositor.poll() do           -- ev: WindowEvent
 //!     match ev.kind
-//!       case WindowEventKind.Opened then …   -- ev.id, ev.title, ev.width, ev.height
+//!       case WindowEventKind.Opened then     -- ev.id, ev.title, ev.width, ev.height
+//!         -- The app only asked for ev.width × ev.height; the WM decides.
+//!         Compositor.configure(ev.id, width, height)
 //!       case WindowEventKind.Closed then …   -- ev.id
 //!       case _ then nil
 //!     end
@@ -141,13 +144,15 @@ impl WindowEvent {
         self.title.clone()
     }
 
-    /// The width the app asked for, for `Opened`.
+    /// The width the app asked for, for `Opened`. Only a request: the
+    /// window gets the size `Compositor.configure` gives it.
     #[saule(getter)]
     pub fn width(&self) -> i64 {
         self.width
     }
 
-    /// The height the app asked for, for `Opened`.
+    /// The height the app asked for, for `Opened`. Only a request: the
+    /// window gets the size `Compositor.configure` gives it.
     #[saule(getter)]
     pub fn height(&self) -> i64 {
         self.height
@@ -477,8 +482,23 @@ fn compositor_pid(id: i64) -> Result<Option<i64>, String> {
     with_server(|s| Ok(s.windows.get(&id).and_then(|w| w.pid).map(i64::from)))
 }
 
-/// `Compositor.configure(id, width, height)` — the size the window is to be
-/// from now on. The app redraws at that size; its next frame arrives with it.
+/// `Compositor.configure(id, width, height)` — give window `id` its size.
+///
+/// The window manager decides how big every window is. The size an app
+/// asks for in `Window.create` only arrives as a request — `ev.width` and
+/// `ev.height` of its `Opened` event — and a window keeps that size until it
+/// is configured. After this call the app's `Window.getSize()` returns the
+/// new size, it gets a `Resized` event, and it redraws at that size; its
+/// next frame arrives in `image(id)` at the new size.
+///
+/// Call it when a window opens, and again whenever the layout changes: a
+/// window opens or closes, or the screen's own size (`Window.getSize()`)
+/// changes. To fill the screen:
+///
+/// ```saule
+/// local width, height = Window.getSize()
+/// Compositor.configure(ev.id, width, height)
+/// ```
 #[saule_export(class = "Compositor", name = "configure")]
 fn compositor_configure(id: i64, width: i64, height: i64) -> Result<(), String> {
     if width <= 0 || height <= 0 {

@@ -113,8 +113,15 @@ fn window_close() {
     state::close();
 }
 
-/// `Window.getSize()` — the window's framebuffer dimensions as two values,
-/// `width, height`. Use it as `local w, h = Window.getSize()`.
+/// `Window.getSize()` — the window's size right now, in pixels, as two
+/// values: `local width, height = Window.getSize()`.
+///
+/// Always the real size, never the one asked for in `Window.create`:
+/// - on a desktop, the window as it is now, so it changes when the window
+///   is resized (ask every frame, or watch for the `Resized` event);
+/// - on the bare screen (Saule Linux), the screen's resolution;
+/// - inside a Saule display server, the size the server gave the window
+///   with `Compositor.configure`.
 #[saule_export(class = "Window", name = "getSize")]
 fn window_get_size() -> Result<(i64, i64), String> {
     let (w, h) = state::with(|e| e.size())?;
