@@ -572,8 +572,8 @@ fn compositor_send_focus(id: i64, focused: bool) -> Result<(), String> {
 }
 
 /// `Compositor.requestClose(id)` — ask the window's app to close it, as a
-/// title bar's close button does. The app decides; `poll` reports
-/// `["closed", id]` when it has.
+/// title bar's close button does. The app decides; `poll` reports a
+/// `WindowEventKind.Closed` event when it has.
 #[saule_export(class = "Compositor", name = "requestClose")]
 fn compositor_request_close(id: i64) -> Result<(), String> {
     tell(id, "close", Vec::new())

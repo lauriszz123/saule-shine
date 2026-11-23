@@ -415,12 +415,19 @@ impl SetCrtcFb for Card {
     }
 }
 
-/// The mode the screen says it prefers — a panel's native resolution — or
-/// failing that the first (largest) one it lists.
+/// The mode to use: one given on the kernel command line (`video=…`) when
+/// there is one, otherwise the one the screen says it prefers — a panel's
+/// native resolution — or failing that the first (largest) one it lists.
+///
+/// The command line wins because whoever wrote it knows better than the
+/// screen: QEMU's virtual GPU reports the size of the window it is shown in
+/// as its preferred mode, so the netbook profile pins the netbook's 1024x600
+/// with `video=Virtual-1:1024x600`, and the window follows the screen
+/// instead of the other way round.
 fn preferred_mode(modes: &[Mode]) -> Mode {
-    modes
-        .iter()
-        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+    let has = |flag: ModeTypeFlags| modes.iter().find(|m| m.mode_type().contains(flag));
+    has(ModeTypeFlags::USERDEF)
+        .or_else(|| has(ModeTypeFlags::PREFERRED))
         .unwrap_or(&modes[0])
         .to_owned()
 }

@@ -240,5 +240,5 @@ pub fn with<R>(f: impl FnOnce(&mut Engine) -> R) -> Result<R, String> {
 /// Run `f` against the renderer. The common case: most `Graphics.*` calls
 /// never touch the window at all.
 pub fn draw<R>(f: impl FnOnce(&mut Renderer) -> R) -> Result<R, String> {
-    with(|engine| f(&mut engine.r))
+    crate::trace::drawing(|| with(|engine| f(&mut engine.r)))
 }

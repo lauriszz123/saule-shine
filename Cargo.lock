@@ -351,7 +351,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1191,7 +1191,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1212,7 +1212,7 @@ dependencies = [
 [[package]]
 name = "saule-export-macro"
 version = "26.0.0"
-source = "git+https://github.com/lauriszz123/saule?branch=develop#f0bc4bb16413ae732f57d338416d678d1167b7db"
+source = "git+https://github.com/lauriszz123/saule?branch=develop#21c604fb7047d56e33af796d0427cd56f8222218"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1223,7 +1223,7 @@ dependencies = [
 [[package]]
 name = "saule-ipc"
 version = "26.0.0"
-source = "git+https://github.com/lauriszz123/saule?branch=develop#f0bc4bb16413ae732f57d338416d678d1167b7db"
+source = "git+https://github.com/lauriszz123/saule?branch=develop#21c604fb7047d56e33af796d0427cd56f8222218"
 dependencies = [
  "libc",
  "mio",
@@ -1233,12 +1233,12 @@ dependencies = [
 [[package]]
 name = "saule-native-abi"
 version = "26.0.0"
-source = "git+https://github.com/lauriszz123/saule?branch=develop#f0bc4bb16413ae732f57d338416d678d1167b7db"
+source = "git+https://github.com/lauriszz123/saule?branch=develop#21c604fb7047d56e33af796d0427cd56f8222218"
 
 [[package]]
 name = "saule-sdk"
 version = "26.0.0"
-source = "git+https://github.com/lauriszz123/saule?branch=develop#f0bc4bb16413ae732f57d338416d678d1167b7db"
+source = "git+https://github.com/lauriszz123/saule?branch=develop#21c604fb7047d56e33af796d0427cd56f8222218"
 dependencies = [
  "saule-export-macro",
  "saule-native-abi",
@@ -1577,7 +1577,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

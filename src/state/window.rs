@@ -173,6 +173,7 @@ impl Engine {
         // An unchanged frame still pumps the event queue, which is the other
         // half of what presenting is for.
         let stale = self.last_blit.elapsed() >= FORCE_BLIT_EVERY;
+        let started = Instant::now();
 
         if self.r.screen_dirty || stale || self.backend.wants_present() {
             let Engine { backend, r, .. } = self;
@@ -193,15 +194,20 @@ impl Engine {
         self.mouse
             .observe(self.backend.mouse_buttons(), self.backend.wheel());
 
+        let presented = started.elapsed();
         let Some(budget) = self.frame_dur else {
+            crate::trace::frame(presented, Duration::ZERO);
             return Ok(()); // uncapped: present and go straight back round
         };
 
         // Pace the loop: sleep off whatever time is left in this frame.
         let now = Instant::now();
+        let mut idle = Duration::ZERO;
         if now < self.next_frame {
-            std::thread::sleep(self.next_frame - now);
+            idle = self.next_frame - now;
+            std::thread::sleep(idle);
         }
+        crate::trace::frame(presented, idle);
         // Schedule the next deadline; if we fell behind (a slow frame), resync
         // from now so we don't try to "catch up" with a burst of zero-sleep
         // frames.

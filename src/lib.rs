@@ -61,6 +61,7 @@ mod raster;
 mod render;
 mod state;
 mod timer;
+mod trace;
 mod window;
 
 saule_sdk::saule_package! {
