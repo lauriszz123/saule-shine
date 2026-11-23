@@ -82,4 +82,10 @@ drm = "0.14"
 # DPI query of its own, so this asks the OS through the native window handle.
 # Windows-only by design: the other platforms report a scale of 1.0 until there
 # is an equally honest way to ask them.
-windows-sys = { version = "0.61", features = ["Win32_UI_HiDpi", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_UI_HiDpi",
+    "Win32_Foundation",
+    # Which monitor a new window opens on (`src/state/placement.rs`).
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }

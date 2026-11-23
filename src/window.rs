@@ -8,17 +8,29 @@ use saule_sdk::saule_export;
 
 use crate::state;
 
-/// `Window.create(width, height, title?, resizable?)` — open a real OS window
-/// and allocate its framebuffer. The title defaults to `"Saule"`, and the
-/// window is resizable unless you say otherwise; the framebuffer follows the
-/// window, so `getSize` reports the live dimensions.
+/// The size `Window.create` opens at when none is given: the Saule Linux
+/// netbook's screen, so a program sized for it looks the same everywhere.
+const DEFAULT_SIZE: (i64, i64) = (1024, 600);
+
+/// `Window.create(width?, height?, title?, resizable?)` — open a real OS
+/// window and allocate its framebuffer. Without a size it is 1024×600; give
+/// both or neither. On the bare screen (Saule Linux) the window is the whole
+/// screen at its own resolution, whatever size is asked for. The title
+/// defaults to `"Saule"`, and the window is resizable unless you say
+/// otherwise; the framebuffer follows the window, so `getSize` reports the
+/// live dimensions.
 #[saule_export(class = "Window", name = "create")]
 pub(crate) fn window_create(
-    width: i64,
-    height: i64,
+    width: Option<i64>,
+    height: Option<i64>,
     title: Option<String>,
     resizable: Option<bool>,
 ) -> Result<(), String> {
+    let (width, height) = match (width, height) {
+        (Some(width), Some(height)) => (width, height),
+        (None, None) => DEFAULT_SIZE,
+        _ => return Err("Window.create: give both width and height, or neither".into()),
+    };
     let title = title.unwrap_or_else(|| "Saule".to_string());
     state::create(width, height, &title, resizable.unwrap_or(true))?;
     crate::timer::reset_clock();

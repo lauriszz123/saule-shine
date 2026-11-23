@@ -15,9 +15,12 @@
 //! Os.spawn("/bin/apps/gamemaker")
 //!
 //! while Window.isOpen() do
-//!   for ev: table in Compositor.poll() do
-//!     -- ["opened", id, title, w, h], ["frame", id], ["title", id, title],
-//!     -- ["cursor", id, name], ["closed", id]
+//!   for ev in Compositor.poll() do           -- ev: WindowEvent
+//!     match ev.kind
+//!       case WindowEventKind.Opened then …   -- ev.id, ev.title, ev.width, ev.height
+//!       case WindowEventKind.Closed then …   -- ev.id
+//!       case _ then nil
+//!     end
 //!   end
 //!   for ev: table in Window.pollEvents() do
 //!     -- route input: Compositor.sendKey(focused, key, true, shift, ctrl, alt) …
@@ -38,7 +41,6 @@ use std::time::Duration;
 use saule_ipc::{ConnId, Handler, Looper, ObjRef, ObjectId, SharedMemory, Wire};
 use saule_sdk::prelude::*;
 use saule_sdk::saule_export;
-use saule_sdk::types::{STable, SValue};
 
 use crate::objects::Image;
 use crate::protocol::{BYTES_PER_PIXEL, DEFAULT_SERVICE, DISPLAY_ENV};
@@ -51,6 +53,111 @@ enum Happened {
     Title(i64, String),
     Cursor(i64, String),
     Closed(i64),
+}
+
+/// What happened to an app's window, for `Compositor.poll`.
+#[saule_enum]
+#[derive(Clone, Copy, PartialEq)]
+pub enum WindowEventKind {
+    /// An app opened a window: `id`, `title`, and the `width` and `height`
+    /// it asked for.
+    Opened,
+    /// The window has new pixels in `Compositor.image(id)`.
+    Frame,
+    /// The app changed the window's `title`.
+    Title,
+    /// The app wants the mouse `cursor` shown over its window to be another
+    /// one: `"arrow"`, `"ibeam"`, `"hand"`, …
+    Cursor,
+    /// The window is gone: its app closed it or ended.
+    Closed,
+}
+
+/// One thing that happened to an app's window since the last
+/// `Compositor.poll`. `id` is always set; fields that do not apply to its
+/// `kind` are `""` or `0`.
+#[saule_class]
+pub struct WindowEvent {
+    kind: WindowEventKind,
+    id: i64,
+    title: String,
+    width: i64,
+    height: i64,
+    cursor: String,
+}
+
+impl WindowEvent {
+    fn blank(kind: WindowEventKind, id: i64) -> Self {
+        WindowEvent {
+            kind,
+            id,
+            title: String::new(),
+            width: 0,
+            height: 0,
+            cursor: String::new(),
+        }
+    }
+
+    fn from_happened(h: Happened) -> Self {
+        match h {
+            Happened::Opened(id, title, width, height) => WindowEvent {
+                title,
+                width,
+                height,
+                ..WindowEvent::blank(WindowEventKind::Opened, id)
+            },
+            Happened::Frame(id) => WindowEvent::blank(WindowEventKind::Frame, id),
+            Happened::Title(id, title) => WindowEvent {
+                title,
+                ..WindowEvent::blank(WindowEventKind::Title, id)
+            },
+            Happened::Cursor(id, cursor) => WindowEvent {
+                cursor,
+                ..WindowEvent::blank(WindowEventKind::Cursor, id)
+            },
+            Happened::Closed(id) => WindowEvent::blank(WindowEventKind::Closed, id),
+        }
+    }
+}
+
+#[saule_methods]
+impl WindowEvent {
+    /// What happened.
+    #[saule(getter)]
+    pub fn kind(&self) -> WindowEventKind {
+        self.kind
+    }
+
+    /// The window it happened to: the id the other `Compositor` functions
+    /// take.
+    #[saule(getter)]
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    /// The window's title, for `Opened` and `Title`.
+    #[saule(getter)]
+    pub fn title(&self) -> String {
+        self.title.clone()
+    }
+
+    /// The width the app asked for, for `Opened`.
+    #[saule(getter)]
+    pub fn width(&self) -> i64 {
+        self.width
+    }
+
+    /// The height the app asked for, for `Opened`.
+    #[saule(getter)]
+    pub fn height(&self) -> i64 {
+        self.height
+    }
+
+    /// The cursor's name, for `Cursor`.
+    #[saule(getter)]
+    pub fn cursor(&self) -> String {
+        self.cursor.clone()
+    }
 }
 
 struct Frame {
@@ -311,11 +418,11 @@ fn compositor_start(service: Option<String>) -> Result<(), String> {
 }
 
 /// `Compositor.poll()` — answer what apps have sent, and return what
-/// happened since the last poll, in order: `["opened", id, title, width,
-/// height]`, `["frame", id]` (new pixels in `image(id)`), `["title", id,
-/// title]`, `["cursor", id, name]`, `["closed", id]`.
+/// happened to their windows since the last poll, in order, as
+/// `WindowEvent`s: `match ev.kind` on `WindowEventKind.Opened`, `Frame`
+/// (new pixels in `image(id)`), `Title`, `Cursor` and `Closed`.
 #[saule_export(class = "Compositor", name = "poll")]
-fn compositor_poll() -> Result<STable, String> {
+fn compositor_poll() -> Result<Vec<WindowEvent>, String> {
     let mut looper = with_server(|s| {
         s.looper
             .take()
@@ -339,39 +446,7 @@ fn compositor_poll() -> Result<STable, String> {
     })?;
     result?;
 
-    let out = STable::new();
-    for h in happened {
-        let rec: STable = STable::new();
-        match h {
-            Happened::Opened(id, title, w, h) => {
-                rec.push(SValue::from("opened"))?;
-                rec.push(SValue::from(id))?;
-                rec.push(SValue::from(title.as_str()))?;
-                rec.push(SValue::from(w))?;
-                rec.push(SValue::from(h))?;
-            }
-            Happened::Frame(id) => {
-                rec.push(SValue::from("frame"))?;
-                rec.push(SValue::from(id))?;
-            }
-            Happened::Title(id, title) => {
-                rec.push(SValue::from("title"))?;
-                rec.push(SValue::from(id))?;
-                rec.push(SValue::from(title.as_str()))?;
-            }
-            Happened::Cursor(id, name) => {
-                rec.push(SValue::from("cursor"))?;
-                rec.push(SValue::from(id))?;
-                rec.push(SValue::from(name.as_str()))?;
-            }
-            Happened::Closed(id) => {
-                rec.push(SValue::from("closed"))?;
-                rec.push(SValue::from(id))?;
-            }
-        }
-        out.push(SValue::from(rec))?;
-    }
-    Ok(out)
+    Ok(happened.into_iter().map(WindowEvent::from_happened).collect())
 }
 
 /// `Compositor.windows()` — the ids of every open window, oldest first.

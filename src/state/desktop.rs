@@ -23,6 +23,9 @@ pub(crate) struct Desktop {
     /// The wheel delta read right after the last pump. minifb clears it at
     /// the start of every `update`, so it is captured while it is valid.
     wheel: (f64, f64),
+    /// Where the window should go, until it has been shown: see
+    /// [`Desktop::place`].
+    pending_position: Option<(i64, i64)>,
 }
 
 impl Desktop {
@@ -47,6 +50,20 @@ impl Desktop {
             },
         )
         .map_err(|e| format!("Window.create: {e}"))?;
+
+        // In the middle of one monitor, whatever the system and however many
+        // monitors it has; see `state/placement.rs`. On X11 the move waits
+        // for the first frame (see `place`); elsewhere it can be made now.
+        let target = super::placement::centred_position(&window, width, height);
+        #[cfg(target_os = "linux")]
+        let pending_position = target;
+        #[cfg(not(target_os = "linux"))]
+        let pending_position = {
+            if let Some((x, y)) = target {
+                window.set_position(x as isize, y as isize);
+            }
+            None
+        };
 
         // We pace the loop ourselves in `present` (a single sleep per frame),
         // so leave minifb's own limiter off — otherwise both `update` and
@@ -81,7 +98,22 @@ impl Desktop {
             shm,
             window,
             wheel: (0.0, 0.0),
+            pending_position,
         })
+    }
+
+    /// Move the window to where it was asked to go, once it is on screen.
+    ///
+    /// On X11, minifb maps the window as it creates it, and the window
+    /// manager then places it whenever it gets to the request. A move sent
+    /// before that lands first and is overwritten, so a new window's
+    /// position — Shine's own centring or an early `Window.setPosition` —
+    /// waits for the first frame to be shown. Elsewhere nothing is ever
+    /// pending.
+    fn place(&mut self) {
+        if let Some((x, y)) = self.pending_position.take() {
+            self.window.set_position(x as isize, y as isize);
+        }
     }
 
     fn read_wheel(&mut self) {
@@ -138,6 +170,7 @@ impl Backend for Desktop {
     fn pump(&mut self) {
         self.window.update();
         self.read_wheel();
+        self.place();
     }
 
     fn present(&mut self, buf: &[u32], w: usize, h: usize) -> Result<(), String> {
@@ -147,6 +180,7 @@ impl Backend for Desktop {
                 .map_err(|e| format!("Graphics.present: {e}"))?;
         }
         self.read_wheel();
+        self.place();
         Ok(())
     }
 
@@ -196,7 +230,11 @@ impl Backend for Desktop {
     }
 
     fn set_position(&mut self, x: i64, y: i64) {
-        self.window.set_position(x as isize, y as isize);
+        if self.pending_position.is_some() {
+            self.pending_position = Some((x, y));
+        } else {
+            self.window.set_position(x as isize, y as isize);
+        }
     }
 
     fn set_topmost(&mut self, topmost: bool) {

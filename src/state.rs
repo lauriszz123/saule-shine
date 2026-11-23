@@ -18,6 +18,7 @@ mod client;
 mod console;
 mod desktop;
 mod input;
+mod placement;
 #[cfg(target_os = "linux")]
 mod shm;
 mod window;

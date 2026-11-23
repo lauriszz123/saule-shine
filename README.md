@@ -204,7 +204,7 @@ between.
 
 ## The `Window` API
 
-**Lifecycle** — `create(width, height [, title, resizable])`, `isOpen()`,
+**Lifecycle** — `create([width, height, title, resizable])` (1024×600 without a size; opens in the middle of the monitor the mouse is on; the whole screen on Saule Linux), `isOpen()`,
 `pollEvents()`, `close()`, `setQuitOnEscape(enable)`, `getQuitOnEscape()`
 
 **Pacing** — `setTargetFPS(fps)`, `getTargetFPS()`
