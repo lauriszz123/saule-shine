@@ -44,6 +44,7 @@
 mod audio;
 mod batch;
 mod clipboard;
+mod compositor;
 mod event;
 mod events;
 mod font;
@@ -54,6 +55,7 @@ mod keyboard;
 mod mouse;
 mod objects;
 mod particles;
+mod protocol;
 mod random;
 mod raster;
 mod render;
@@ -74,6 +76,7 @@ saule_sdk::saule_package! {
         Clipboard = "System clipboard: copy and paste plain text.",
         Random = "Seedable random numbers and Perlin noise — Love2D's `love.math`.",
         Audio = "Sound: load or synthesise sources and play them — Love2D's `love.audio`.",
+        Compositor = "For a display server: other Shine programs' windows, as images to draw and targets for input.",
     }
 }
 

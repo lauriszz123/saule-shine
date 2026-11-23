@@ -1,0 +1,485 @@
+//! `Compositor` — Shine for a display server: the windows of other Shine
+//! programs, as images to draw and targets to send input to.
+//!
+//! A window manager written in Saule opens its own window (the whole screen
+//! on Saule Linux, an ordinary window on a desktop), calls
+//! `Compositor.start()`, and from then on every Shine program it starts opens
+//! its window *here* instead (see [`crate::protocol`]). The window manager
+//! decides everything a window manager decides — where each window goes, how
+//! big it is, which one has focus, what the title bars look like — and uses
+//! this class only for the plumbing:
+//!
+//! ```saule
+//! Window.create(1024, 600, title: "wm")
+//! Compositor.start()
+//! Os.spawn("/bin/apps/gamemaker")
+//!
+//! while Window.isOpen() do
+//!   for ev: table in Compositor.poll() do
+//!     -- ["opened", id, title, w, h], ["frame", id], ["title", id, title],
+//!     -- ["cursor", id, name], ["closed", id]
+//!   end
+//!   for ev: table in Window.pollEvents() do
+//!     -- route input: Compositor.sendKey(focused, key, true, shift, ctrl, alt) …
+//!   end
+//!   Graphics.clear()
+//!   for id: integer in Compositor.windows() do
+//!     local image = Compositor.image(id)
+//!     if image != nil then Graphics.draw(image!, x, y) end
+//!   end
+//!   Graphics.present()
+//! end
+//! ```
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use saule_ipc::{ConnId, Handler, Looper, ObjRef, ObjectId, SharedMemory, Wire};
+use saule_sdk::prelude::*;
+use saule_sdk::saule_export;
+use saule_sdk::types::{STable, SValue};
+
+use crate::objects::Image;
+use crate::protocol::{BYTES_PER_PIXEL, DEFAULT_SERVICE, DISPLAY_ENV};
+use crate::state;
+
+/// Something that happened to a window, for `Compositor.poll`.
+enum Happened {
+    Opened(i64, String, i64, i64),
+    Frame(i64),
+    Title(i64, String),
+    Cursor(i64, String),
+    Closed(i64),
+}
+
+struct Frame {
+    mem: SharedMemory,
+    w: i64,
+    h: i64,
+}
+
+struct Win {
+    conn: ConnId,
+    /// The app's events object, for input and `configure`.
+    events: ObjectId,
+    title: String,
+    pid: Option<u32>,
+    /// The size the app draws at, from its last `attach`.
+    frame: Option<Frame>,
+    /// The latest frame, as the image `Compositor.image` hands out — one
+    /// object, kept, so every call returns the same image.
+    image: Option<(SObject<Image>, i64, i64)>,
+}
+
+struct Server {
+    name: String,
+    /// Taken out while calls are being answered.
+    looper: Option<Looper>,
+    windows: BTreeMap<i64, Win>,
+    next_id: i64,
+    happened: Vec<Happened>,
+}
+
+thread_local! {
+    static SERVER: RefCell<Option<Server>> = const { RefCell::new(None) };
+}
+
+fn with_server<R>(f: impl FnOnce(&mut Server) -> Result<R, String>) -> Result<R, String> {
+    SERVER.with(|s| match s.borrow_mut().as_mut() {
+        Some(server) => f(server),
+        None => Err("the compositor is not started — call Compositor.start() first".into()),
+    })
+}
+
+/// Whether this process is the display server for `service` — so its own
+/// `Window.create` opens a real window rather than one inside itself.
+pub(crate) fn serving(service: &str) -> bool {
+    SERVER.with(|s| s.borrow().as_ref().is_some_and(|srv| srv.name == service))
+}
+
+fn int(w: &Wire) -> Result<i64, String> {
+    match w {
+        Wire::Int(i) => Ok(*i),
+        _ => Err("expected an integer".into()),
+    }
+}
+
+/// Answers apps' calls about their windows.
+struct Apps;
+
+impl Apps {
+    fn owned(s: &mut Server, from: ConnId, id: i64) -> Result<&mut Win, String> {
+        s.windows
+            .get_mut(&id)
+            .filter(|w| w.conn == from)
+            .ok_or_else(|| format!("no window {id} of yours"))
+    }
+
+    /// Make the app's latest frame the window's image.
+    fn commit(from: ConnId, id: i64) -> Result<(), String> {
+        // Read the frame and what image there is, then let go of the server
+        // before calling into the renderer.
+        let (pixels, w, h, image) = with_server(|s| {
+            let win = Apps::owned(s, from, id)?;
+            let frame = win.frame.as_ref().ok_or("a frame committed before any attach")?;
+            Ok((
+                frame.mem.as_slice().to_vec(),
+                frame.w,
+                frame.h,
+                win.image.clone(),
+            ))
+        })?;
+        let handle = match image {
+            Some((img, iw, ih)) if (iw, ih) == (w, h) => img.borrow()?.handle,
+            _ => {
+                let handle = state::draw(|g| g.new_blank_image(w, h))??;
+                let img = SObject::new(Image::from_handle(handle)?);
+                with_server(|s| {
+                    if let Some(win) = s.windows.get_mut(&id) {
+                        win.image = Some((img, w, h));
+                    }
+                    Ok(())
+                })?;
+                handle
+            }
+        };
+        state::draw(|g| g.upload_opaque(handle, &pixels))??;
+        with_server(|s| {
+            s.happened.push(Happened::Frame(id));
+            Ok(())
+        })
+    }
+}
+
+impl Handler for Apps {
+    fn call(
+        &mut self,
+        looper: &mut Looper,
+        from: ConnId,
+        _key: u64,
+        method: &str,
+        args: Vec<Wire>,
+    ) -> Result<Vec<Wire>, String> {
+        match method {
+            "createWindow" => {
+                let [Wire::Str(title), w, h, Wire::Object(ObjRef::Remote { id: events, .. })] =
+                    args.as_slice()
+                else {
+                    return Err("createWindow(title, w, h, events)".into());
+                };
+                let (w, h) = (int(w)?, int(h)?);
+                let pid = looper.peer(from).and_then(|p| p.pid);
+                let title = title.clone();
+                let events = *events;
+                with_server(|s| {
+                    s.next_id += 1;
+                    let id = s.next_id;
+                    s.windows.insert(
+                        id,
+                        Win {
+                            conn: from,
+                            events,
+                            title: title.clone(),
+                            pid,
+                            frame: None,
+                            image: None,
+                        },
+                    );
+                    s.happened.push(Happened::Opened(id, title, w, h));
+                    Ok(vec![Wire::Int(id)])
+                })
+            }
+            "attach" => {
+                let mut args = args.into_iter();
+                let (Some(id), Some(Wire::Shm(handle, len)), Some(w), Some(h)) =
+                    (args.next(), args.next(), args.next(), args.next())
+                else {
+                    return Err("attach(id, pixels, w, h)".into());
+                };
+                let (id, w, h) = (int(&id)?, int(&w)?, int(&h)?);
+                if w <= 0 || h <= 0 || w > 16384 || h > 16384 {
+                    return Err(format!("attach: a {w}×{h} frame"));
+                }
+                let need = (w * h) as usize * BYTES_PER_PIXEL;
+                if (len as usize) < need {
+                    return Err(format!("attach: {len} bytes for a {w}×{h} frame"));
+                }
+                let mem = SharedMemory::from_fd(handle, need).map_err(|e| format!("attach: {e}"))?;
+                with_server(|s| {
+                    Apps::owned(s, from, id)?.frame = Some(Frame { mem, w, h });
+                    Ok(Vec::new())
+                })
+            }
+            "commit" => {
+                let id = int(args.first().ok_or("commit(id)")?)?;
+                Apps::commit(from, id)?;
+                Ok(Vec::new())
+            }
+            "setTitle" | "setCursor" => {
+                let [id, Wire::Str(text)] = args.as_slice() else {
+                    return Err(format!("{method}(id, text)"));
+                };
+                let id = int(id)?;
+                let text = text.clone();
+                with_server(|s| {
+                    let win = Apps::owned(s, from, id)?;
+                    if method == "setTitle" {
+                        win.title = text.clone();
+                        s.happened.push(Happened::Title(id, text));
+                    } else {
+                        s.happened.push(Happened::Cursor(id, text));
+                    }
+                    Ok(Vec::new())
+                })
+            }
+            "close" => {
+                let id = int(args.first().ok_or("close(id)")?)?;
+                with_server(|s| {
+                    if s.windows.get(&id).is_some_and(|w| w.conn == from) {
+                        s.windows.remove(&id);
+                        s.happened.push(Happened::Closed(id));
+                    }
+                    Ok(Vec::new())
+                })
+            }
+            other => Err(format!("the display server has no call `{other}`")),
+        }
+    }
+
+    fn disconnected(&mut self, _: &mut Looper, conn: ConnId) {
+        // The app ended or crashed: its windows go with it.
+        let _ = with_server(|s| {
+            let gone: Vec<i64> = s
+                .windows
+                .iter()
+                .filter(|(_, w)| w.conn == conn)
+                .map(|(&id, _)| id)
+                .collect();
+            for id in gone {
+                s.windows.remove(&id);
+                s.happened.push(Happened::Closed(id));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// A one-way call to window `id`'s app. A window whose app has gone is
+/// reported closed by the next `poll`, so this does not fail for it.
+fn tell(id: i64, method: &str, args: Vec<Wire>) -> Result<(), String> {
+    with_server(|s| {
+        let win = s.windows.get(&id).ok_or_else(|| format!("no window {id}"))?;
+        let (conn, events) = (win.conn, win.events);
+        if let Some(lp) = s.looper.as_mut() {
+            let _ = lp.send(conn, events, method, args);
+        }
+        Ok(())
+    })
+}
+
+// --- Exports -------------------------------------------------------------------------
+
+/// `Compositor.start([service])` — become the display server: Shine
+/// programs this process starts from now on open their windows here. The
+/// service defaults to `"saule.display"`. Open this process's own window
+/// first: the windows of others are drawn into it.
+#[saule_export(class = "Compositor", name = "start")]
+fn compositor_start(service: Option<String>) -> Result<(), String> {
+    state::with(|_| ()).map_err(|_| "Compositor.start: open a window first (Window.create)")?;
+    if SERVER.with(|s| s.borrow().is_some()) {
+        return Err("Compositor.start: already started".into());
+    }
+    let name = service.unwrap_or_else(|| DEFAULT_SERVICE.to_string());
+    let mut looper = Looper::new();
+    looper
+        .publish(&name, 0)
+        .map_err(|e| format!("Compositor.start: {e}"))?;
+    // Safety: set before the programs that read it are started, and Saule
+    // runs one thread; nothing else is reading the environment meanwhile.
+    unsafe { std::env::set_var(DISPLAY_ENV, &name) };
+    SERVER.with(|s| {
+        *s.borrow_mut() = Some(Server {
+            name,
+            looper: Some(looper),
+            windows: BTreeMap::new(),
+            next_id: 0,
+            happened: Vec::new(),
+        })
+    });
+    Ok(())
+}
+
+/// `Compositor.poll()` — answer what apps have sent, and return what
+/// happened since the last poll, in order: `["opened", id, title, width,
+/// height]`, `["frame", id]` (new pixels in `image(id)`), `["title", id,
+/// title]`, `["cursor", id, name]`, `["closed", id]`.
+#[saule_export(class = "Compositor", name = "poll")]
+fn compositor_poll() -> Result<STable, String> {
+    let mut looper = with_server(|s| {
+        s.looper
+            .take()
+            .ok_or_else(|| "Compositor.poll: already polling".to_string())
+    })?;
+    let mut result = Ok(());
+    // Everything that has arrived, without waiting.
+    for _ in 0..64 {
+        match looper.dispatch(&mut Apps, Some(Duration::ZERO)) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                result = Err(format!("Compositor.poll: {e}"));
+                break;
+            }
+        }
+    }
+    let happened = with_server(|s| {
+        s.looper = Some(looper);
+        Ok(std::mem::take(&mut s.happened))
+    })?;
+    result?;
+
+    let out = STable::new();
+    for h in happened {
+        let rec: STable = STable::new();
+        match h {
+            Happened::Opened(id, title, w, h) => {
+                rec.push(SValue::from("opened"))?;
+                rec.push(SValue::from(id))?;
+                rec.push(SValue::from(title.as_str()))?;
+                rec.push(SValue::from(w))?;
+                rec.push(SValue::from(h))?;
+            }
+            Happened::Frame(id) => {
+                rec.push(SValue::from("frame"))?;
+                rec.push(SValue::from(id))?;
+            }
+            Happened::Title(id, title) => {
+                rec.push(SValue::from("title"))?;
+                rec.push(SValue::from(id))?;
+                rec.push(SValue::from(title.as_str()))?;
+            }
+            Happened::Cursor(id, name) => {
+                rec.push(SValue::from("cursor"))?;
+                rec.push(SValue::from(id))?;
+                rec.push(SValue::from(name.as_str()))?;
+            }
+            Happened::Closed(id) => {
+                rec.push(SValue::from("closed"))?;
+                rec.push(SValue::from(id))?;
+            }
+        }
+        out.push(SValue::from(rec))?;
+    }
+    Ok(out)
+}
+
+/// `Compositor.windows()` — the ids of every open window, oldest first.
+#[saule_export(class = "Compositor", name = "windows")]
+fn compositor_windows() -> Result<Vec<i64>, String> {
+    with_server(|s| Ok(s.windows.keys().copied().collect()))
+}
+
+/// `Compositor.image(id)` — the window's latest frame, to draw with
+/// `Graphics.draw`; `nil` until the app has presented one. The same image
+/// every call, updated in place as frames arrive — a new one only when the
+/// window's size changes.
+#[saule_export(class = "Compositor", name = "image")]
+fn compositor_image(id: i64) -> Result<Option<SObject<Image>>, String> {
+    with_server(|s| Ok(s.windows.get(&id).and_then(|w| w.image.as_ref().map(|(i, _, _)| i.clone()))))
+}
+
+/// `Compositor.title(id)` — the window's title, `nil` for no such window.
+#[saule_export(class = "Compositor", name = "title")]
+fn compositor_title(id: i64) -> Result<Option<String>, String> {
+    with_server(|s| Ok(s.windows.get(&id).map(|w| w.title.clone())))
+}
+
+/// `Compositor.pid(id)` — the process id of the window's app, as the system
+/// reports it.
+#[saule_export(class = "Compositor", name = "pid")]
+fn compositor_pid(id: i64) -> Result<Option<i64>, String> {
+    with_server(|s| Ok(s.windows.get(&id).and_then(|w| w.pid).map(i64::from)))
+}
+
+/// `Compositor.configure(id, width, height)` — the size the window is to be
+/// from now on. The app redraws at that size; its next frame arrives with it.
+#[saule_export(class = "Compositor", name = "configure")]
+fn compositor_configure(id: i64, width: i64, height: i64) -> Result<(), String> {
+    if width <= 0 || height <= 0 {
+        return Err("Compositor.configure: width and height must be positive".into());
+    }
+    tell(id, "configure", vec![Wire::Int(width), Wire::Int(height)])
+}
+
+/// `Compositor.sendKey(id, key, down, shift, ctrl, alt)` — a key pressed or
+/// released, by Shine's key name, to the window's app.
+#[saule_export(class = "Compositor", name = "sendKey")]
+fn compositor_send_key(
+    id: i64,
+    key: String,
+    down: bool,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+) -> Result<(), String> {
+    tell(
+        id,
+        "key",
+        vec![
+            Wire::Str(key),
+            Wire::Bool(down),
+            Wire::Bool(shift),
+            Wire::Bool(ctrl),
+            Wire::Bool(alt),
+        ],
+    )
+}
+
+/// `Compositor.sendText(id, text)` — typed text, to the window's app.
+#[saule_export(class = "Compositor", name = "sendText")]
+fn compositor_send_text(id: i64, text: String) -> Result<(), String> {
+    tell(id, "text", vec![Wire::Str(text)])
+}
+
+/// `Compositor.sendPointer(id, x, y)` — the pointer is over the window, at
+/// `(x, y)` in the window's own coordinates.
+#[saule_export(class = "Compositor", name = "sendPointer")]
+fn compositor_send_pointer(id: i64, x: f64, y: f64) -> Result<(), String> {
+    tell(id, "pointer", vec![Wire::Float(x), Wire::Float(y)])
+}
+
+/// `Compositor.sendLeave(id)` — the pointer has left the window.
+#[saule_export(class = "Compositor", name = "sendLeave")]
+fn compositor_send_leave(id: i64) -> Result<(), String> {
+    tell(id, "leave", Vec::new())
+}
+
+/// `Compositor.sendButton(id, button, down)` — a mouse button (1 left,
+/// 2 right, 3 middle) pressed or released over the window.
+#[saule_export(class = "Compositor", name = "sendButton")]
+fn compositor_send_button(id: i64, button: i64, down: bool) -> Result<(), String> {
+    tell(id, "button", vec![Wire::Int(button), Wire::Bool(down)])
+}
+
+/// `Compositor.sendWheel(id, dx, dy)` — wheel movement in notches, positive
+/// `dy` away from the user.
+#[saule_export(class = "Compositor", name = "sendWheel")]
+fn compositor_send_wheel(id: i64, dx: f64, dy: f64) -> Result<(), String> {
+    tell(id, "wheel", vec![Wire::Float(dx), Wire::Float(dy)])
+}
+
+/// `Compositor.sendFocus(id, focused)` — the window gained or lost keyboard
+/// focus.
+#[saule_export(class = "Compositor", name = "sendFocus")]
+fn compositor_send_focus(id: i64, focused: bool) -> Result<(), String> {
+    tell(id, "focus", vec![Wire::Bool(focused)])
+}
+
+/// `Compositor.requestClose(id)` — ask the window's app to close it, as a
+/// title bar's close button does. The app decides; `poll` reports
+/// `["closed", id]` when it has.
+#[saule_export(class = "Compositor", name = "requestClose")]
+fn compositor_request_close(id: i64) -> Result<(), String> {
+    tell(id, "close", Vec::new())
+}

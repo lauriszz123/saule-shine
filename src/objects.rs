@@ -55,7 +55,8 @@ impl Drop for Image {
 }
 
 impl Image {
-    fn from_handle(handle: i64) -> Result<Self, String> {
+    /// An image the renderer already holds under `handle`.
+    pub(crate) fn from_handle(handle: i64) -> Result<Self, String> {
         let (w, h) = state::draw(|gfx| gfx.image_size(handle))??;
         Ok(Image { handle, w, h })
     }

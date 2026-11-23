@@ -13,6 +13,7 @@
 //! not `Send`), and matches the actual call pattern exactly.
 
 mod backend;
+mod client;
 #[cfg(target_os = "linux")]
 mod console;
 mod desktop;
@@ -142,16 +143,27 @@ pub fn create(width: i64, height: i64, title: &str, resizable: bool) -> Result<(
 
 /// Open the backend `Window.create` asked for.
 ///
-/// On Linux with no desktop session — no `DISPLAY`, no `WAYLAND_DISPLAY` — and
-/// a DRM device, that is the bare screen: Saule Linux, where the program
-/// itself is the display. `SHINE_BACKEND=console` or `desktop` overrides the
-/// guess.
+/// With `SAULE_DISPLAY` set, a window inside that Saule display server (see
+/// [`crate::protocol`]). Otherwise, on Linux with no desktop session — no
+/// `DISPLAY`, no `WAYLAND_DISPLAY` — and a DRM device, the bare screen: Saule
+/// Linux, where the program itself is the display. `SHINE_BACKEND=console` or
+/// `desktop` overrides that guess. Everywhere else, a desktop window.
 fn open_backend(
     title: &str,
     width: usize,
     height: usize,
     resizable: bool,
 ) -> Result<Box<dyn Backend>, String> {
+    // Inside a Saule display server, unless this process *is* that server.
+    if let Some(service) = std::env::var(crate::protocol::DISPLAY_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        && !crate::compositor::serving(&service)
+    {
+        return Ok(Box::new(client::Client::open(
+            &service, title, width, height,
+        )?));
+    }
     #[cfg(target_os = "linux")]
     if console::wanted() {
         return Ok(Box::new(console::Console::open()?));

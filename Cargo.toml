@@ -32,6 +32,10 @@ codegen-units = 1
 # the native ABI version is checked at load, so the toolchain a package is built
 # against is part of what it ships.
 saule-sdk = { git = "https://github.com/lauriszz123/saule", branch = "develop" }
+# Windows under a Saule display server (`src/protocol.rs`): an app's Shine
+# talks to the server's Shine over Saule's own IPC transport — Unix sockets
+# or Windows named pipes, with the pixels in shared memory.
+saule-ipc = { git = "https://github.com/lauriszz123/saule", branch = "develop" }
 # X11-only on Linux: WSLg's Wayland compositor (Weston) lacks server-side
 # window decorations, so minifb's Wayland backend fails to map a visible
 # window ("Failed to create server-side surface decoration: Missing").

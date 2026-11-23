@@ -204,6 +204,22 @@ impl Renderer {
         Ok(insert(&mut self.canvases, &mut self.free_canvases, out))
     }
 
+    /// Overwrite an image with a frame of little-endian `0x00RRGGBB` pixels
+    /// — another process's window, as it arrives in a display server —
+    /// made fully opaque, since a framebuffer's alpha byte means nothing.
+    /// The frame must be the image's size.
+    pub(crate) fn upload_opaque(&mut self, handle: i64, frame: &[u8]) -> Result<(), String> {
+        let dst = self.pixels_mut(handle, "Compositor")?;
+        if frame.len() < dst.buf.len() * 4 {
+            return Err("Compositor: a frame smaller than its window".into());
+        }
+        let (pixels, _) = frame.as_chunks::<4>();
+        for (px, src) in dst.buf.iter_mut().zip(pixels) {
+            *px = 0xFF00_0000 | u32::from_le_bytes([src[0], src[1], src[2], 0]);
+        }
+        Ok(())
+    }
+
     /// Overwrite these pixels with another image's, which must be the same
     /// size — how an undo puts a snapshot back.
     pub(crate) fn replace_pixels(&mut self, handle: i64, from: i64) -> Result<(), String> {
