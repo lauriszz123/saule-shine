@@ -68,6 +68,10 @@ rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis
 # X11 headers are needed, and `libc` provides the SysV shared-memory calls.
 x11-dl = "2.21"
 libc = "0.2"
+# The console backend (`src/state/console/`): the screen through DRM/KMS dumb
+# buffers when there is no X11 or Wayland session — Saule Linux's bare
+# screen. Pure Rust (rustix ioctls), so it needs no libdrm.
+drm = "0.14"
 
 [target.'cfg(windows)'.dependencies]
 # Per-monitor DPI awareness, and the scale factor for the window. minifb has no

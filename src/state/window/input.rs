@@ -4,7 +4,7 @@
 use super::*;
 use crate::event::Event;
 use crate::keyboard::{self, KeyState};
-use minifb::{CursorStyle, Key, MouseMode};
+use minifb::{CursorStyle, Key};
 
 /// How long after a click a second one still counts as a double-click, and how
 /// far the pointer may drift in between.
@@ -14,24 +14,19 @@ const DOUBLE_CLICK_SLOP: f64 = 4.0;
 impl Engine {
     /// Cursor position in framebuffer pixels, clamped to the window bounds.
     ///
-    /// minifb reports this in the same units as `get_size`, which on macOS is
-    /// points — so it is scaled to match the framebuffer, or every hit test
-    /// would be off by the backing scale on a Retina display.
+    /// The backend reports this in the same units as its size, which on
+    /// macOS is points — so it is scaled to match the framebuffer, or every
+    /// hit test would be off by the backing scale on a Retina display.
     pub(crate) fn mouse_pos(&self) -> (f64, f64) {
         let backing = self.backing_scale();
-        self.window
-            .get_mouse_pos(MouseMode::Clamp)
-            .map(|(x, y)| (x as f64 * backing, y as f64 * backing))
-            .unwrap_or((0.0, 0.0))
+        let (x, y) = self.backend.mouse_pos_clamped();
+        (x * backing, y * backing)
     }
 
-    /// Whether the pointer is over the window right now.
-    ///
-    /// `Discard` is the mode that answers this: it reports `None` rather than
-    /// clamping when the pointer is outside, which is what separates "at the
-    /// edge" from "gone".
+    /// Whether the pointer is over the window right now, as opposed to
+    /// clamped to its edge.
     pub(crate) fn pointer_over_window(&self) -> bool {
-        self.window.get_mouse_pos(MouseMode::Discard).is_some()
+        self.backend.mouse_pos().is_some()
     }
 
     /// This frame's mouse state: held buttons, edges, and wheel movement.
@@ -62,23 +57,23 @@ impl Engine {
                 ));
             }
         };
-        self.window.set_cursor_style(cursor);
+        self.backend.set_cursor(cursor);
         Ok(())
     }
 
     pub(crate) fn set_cursor_visible(&mut self, visible: bool) {
-        self.window.set_cursor_visibility(visible);
+        self.backend.set_cursor_visible(visible);
     }
 
     pub(crate) fn is_key_down(&self, key: Key) -> bool {
-        self.window.is_key_down(key)
+        self.backend.is_key_down(key)
     }
 
     /// The canonical names of every key held right now, in the keyboard
     /// module's table order. Unnameable keys are skipped.
     pub(crate) fn keys_held(&self) -> Vec<&'static str> {
-        self.window
-            .get_keys()
+        self.backend
+            .keys_down()
             .into_iter()
             .filter_map(keyboard::key_name)
             .collect()
@@ -97,9 +92,10 @@ impl Engine {
     /// `is_open` / input fresh at the top of the loop, and is the frame
     /// boundary the keyboard's press/release edges are measured against.
     pub(crate) fn poll_events(&mut self) {
-        self.window.update();
-        self.keys.sync(&self.window);
-        self.mouse.sync(&self.window);
+        self.backend.pump();
+        self.keys.sync(&self.backend.keys_down());
+        self.mouse
+            .sync(self.backend.mouse_buttons(), self.backend.wheel());
 
         let resized = self.sync_surface();
         self.collect_events(resized);
@@ -126,7 +122,7 @@ impl Engine {
             });
         }
 
-        let focused = self.window.is_active();
+        let focused = self.backend.is_active();
         if focused != self.last_focused {
             self.last_focused = focused;
             self.events.push(Event::FocusChanged(focused));

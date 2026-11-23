@@ -1,12 +1,10 @@
 //! Mouse state and the wheel / button bookkeeping the script-facing
 //! queries read.
 
-use minifb::{MouseButton, Window};
-
 /// Per-frame mouse edges and wheel movement, latched by
 /// [`Engine::poll_events`] the same way [`KeyState`] latches key edges.
 ///
-/// minifb reports the wheel as a delta that is only valid for the `update`
+/// Backends report the wheel as a delta that is only valid for the pump
 /// that produced it, so it has to be captured at the frame boundary or it is
 /// lost. Buttons are sampled the same way, and both feed the `MousePressed` /
 /// `MouseReleased` / `WheelMoved` events the frame's queue is built from.
@@ -18,7 +16,7 @@ pub struct MouseState {
     released: [bool; 3],
     wheel: (f64, f64),
     /// Edges and wheel movement seen during a `present`. Same reason as
-    /// [`crate::keyboard::KeyState`]: minifb pumps the OS queue twice a frame
+    /// [`crate::keyboard::KeyState`]: the backend is pumped twice a frame
     /// and each pump clears its own scroll delta, so half of them would be
     /// thrown away before Saule ever saw them.
     carried_pressed: [bool; 3],
@@ -26,25 +24,17 @@ pub struct MouseState {
     carried_wheel: (f64, f64),
 }
 
-/// One wheel notch in minifb's units: it reports `WHEEL_DELTA` (120) scaled by
-/// 0.1, so a single click arrives as 12.0. Normalising to 1.0 per notch is what
-/// makes "pixels per notch" mean anything on the Saule side.
-pub(crate) const WHEEL_NOTCH: f64 = 12.0;
-
 impl MouseState {
-    pub(crate) fn sync(&mut self, window: &Window) {
-        const BUTTONS: [MouseButton; 3] =
-            [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
-
-        for (i, button) in BUTTONS.iter().enumerate() {
-            let now = window.get_mouse_down(*button);
+    /// Latch this frame's buttons and wheel, given the backend's view right
+    /// after `pollEvents` pumped it. Called once per `Window.pollEvents`.
+    pub(crate) fn sync(&mut self, buttons: [bool; 3], wheel: (f64, f64)) {
+        for (i, &now) in buttons.iter().enumerate() {
             self.pressed[i] = (now && !self.down[i]) || self.carried_pressed[i];
             self.released[i] = (!now && self.down[i]) || self.carried_released[i];
             self.down[i] = now;
         }
 
-        let (wx, wy) = Self::read_wheel(window);
-        self.wheel = (wx + self.carried_wheel.0, wy + self.carried_wheel.1);
+        self.wheel = (wheel.0 + self.carried_wheel.0, wheel.1 + self.carried_wheel.1);
 
         self.carried_pressed = [false; 3];
         self.carried_released = [false; 3];
@@ -53,13 +43,8 @@ impl MouseState {
 
     /// Sample the mouse after presenting, keeping the edges and wheel movement
     /// for the next [`MouseState::sync`].
-    pub(crate) fn observe(&mut self, window: &Window) {
-        const BUTTONS: [MouseButton; 3] =
-            [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
-
-        for (i, button) in BUTTONS.iter().enumerate() {
-            let now = window.get_mouse_down(*button);
-
+    pub(crate) fn observe(&mut self, buttons: [bool; 3], wheel: (f64, f64)) {
+        for (i, &now) in buttons.iter().enumerate() {
             if now && !self.down[i] {
                 self.carried_pressed[i] = true;
             }
@@ -71,15 +56,7 @@ impl MouseState {
             self.down[i] = now;
         }
 
-        let (wx, wy) = Self::read_wheel(window);
-        self.carried_wheel = (self.carried_wheel.0 + wx, self.carried_wheel.1 + wy);
-    }
-
-    /// The wheel delta in notches: 1.0 per click, positive away from the user.
-    pub(crate) fn read_wheel(window: &Window) -> (f64, f64) {
-        window.get_scroll_wheel().map_or((0.0, 0.0), |(x, y)| {
-            (f64::from(x) / WHEEL_NOTCH, f64::from(y) / WHEEL_NOTCH)
-        })
+        self.carried_wheel = (self.carried_wheel.0 + wheel.0, self.carried_wheel.1 + wheel.1);
     }
 
     /// `1` = left, `2` = right, `3` = middle; anything else is not a button.

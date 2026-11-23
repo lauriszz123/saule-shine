@@ -12,6 +12,10 @@
 //! `Send`/`Sync` requirements a `static` would impose (minifb's `Window` is
 //! not `Send`), and matches the actual call pattern exactly.
 
+mod backend;
+#[cfg(target_os = "linux")]
+mod console;
+mod desktop;
 mod input;
 #[cfg(target_os = "linux")]
 mod shm;
@@ -23,21 +27,17 @@ pub(crate) use window::*;
 use std::cell::RefCell;
 use std::time::Instant;
 
-use minifb::{Scale, Window, WindowOptions};
+use backend::Backend;
 
 use crate::event::Event;
-use crate::keyboard::{self, KeyState, TextCollector};
+use crate::keyboard::{self, KeyState};
 use crate::render::Renderer;
 
 /// Live engine state, created by `Window.create`.
 pub struct Engine {
-    /// Presents frames through X11 shared memory instead of minifb's
-    /// `XPutImage` when the server allows it (see `state/shm.rs`). `None`
-    /// means minifb presents. Declared before `window` so it is dropped
-    /// first, while the window it draws into still exists.
-    #[cfg(target_os = "linux")]
-    pub(crate) shm: Option<shm::ShmPresenter>,
-    pub(crate) window: Window,
+    /// What the frames are shown on and input comes from: a desktop window,
+    /// or the bare screen (see [`backend`]).
+    pub(crate) backend: Box<dyn Backend>,
     /// Render targets, graphics state, and resources.
     pub(crate) r: Renderer,
     /// Per-frame keyboard edges, latched by [`Engine::poll_events`].
@@ -96,69 +96,31 @@ pub fn create(width: i64, height: i64, title: &str, resizable: bool) -> Result<(
     let width = width as usize;
     let height = height as usize;
 
-    let mut window = Window::new(
-        title,
-        width,
-        height,
-        WindowOptions {
-            resize: resizable,
-            scale: Scale::X1,
-            // Keep the framebuffer 1:1 with the window: the engine reallocates
-            // it on resize rather than letting minifb stretch a stale buffer.
-            scale_mode: minifb::ScaleMode::Stretch,
-            ..WindowOptions::default()
-        },
-    )
-    .map_err(|e| format!("Window.create: {e}"))?;
-
-    // We pace the loop ourselves in `present` (a single sleep per frame), so
-    // leave minifb's own limiter off — otherwise both `update` and
-    // `update_with_buffer` would each block and halve the frame rate.
-    window.set_target_fps(0);
-
-    // Typed text and key edges arrive through this callback while `update`
-    // pumps the queue; `Engine::collect_events` and `KeyState::sync` drain what
-    // it collects.
-    window.set_input_callback(Box::new(TextCollector));
+    // Close the old window first: on the bare screen there is one display,
+    // and the new backend cannot take it while the old one holds it.
+    close();
     keyboard::reset_input();
 
-    let scale = query_scale(&window);
+    let backend = open_backend(title, width, height, resizable)?;
+    let scale = backend.scale();
 
-    // The window was asked for in whatever units minifb takes; the framebuffer
-    // is physical pixels. On a Retina display those differ from the first
-    // frame, and waiting for the first `pollEvents` to notice would open with
-    // one frame at half resolution.
-    let backing = backing_scale_for(scale);
-    let buffer_w = (width as f64 * backing).round() as usize;
-    let buffer_h = (height as f64 * backing).round() as usize;
+    // The window was asked for in whatever units the backend takes; the
+    // framebuffer is physical pixels. On a Retina display those differ from
+    // the first frame, and waiting for the first `pollEvents` to notice would
+    // open with one frame at half resolution. On the bare screen the size is
+    // the screen's, whatever was asked for.
+    let (units_w, units_h) = backend.size();
+    let backing = backend.backing_scale();
+    let buffer_w = (units_w as f64 * backing).round() as usize;
+    let buffer_h = (units_h as f64 * backing).round() as usize;
 
     // Objects bound to the previous window name its registries, not this one.
     crate::objects::reset_bindings();
     PENDING.with(|p| p.borrow_mut().clear());
 
-    // `SHINE_NO_SHM=1` keeps minifb presenting, to rule shared memory out
-    // when chasing a display problem.
-    #[cfg(target_os = "linux")]
-    let shm = if std::env::var_os("SHINE_NO_SHM").is_some() {
-        None
-    } else {
-        shm::ShmPresenter::new(window.get_window_handle() as std::os::raw::c_ulong)
-    };
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("SHINE_TRACE_PRESENT").is_some() {
-        let how = if shm.is_some() {
-            "X11 shared memory"
-        } else {
-            "minifb"
-        };
-        eprintln!("shine: presenting through {how}");
-    }
-
     ENGINE.with(|cell| {
         *cell.borrow_mut() = Some(Engine {
-            #[cfg(target_os = "linux")]
-            shm,
-            window,
+            backend,
             r: Renderer::new(buffer_w, buffer_h),
             keys: KeyState::default(),
             mouse: MouseState::default(),
@@ -176,6 +138,27 @@ pub fn create(width: i64, height: i64, title: &str, resizable: bool) -> Result<(
         });
     });
     Ok(())
+}
+
+/// Open the backend `Window.create` asked for.
+///
+/// On Linux with no desktop session — no `DISPLAY`, no `WAYLAND_DISPLAY` — and
+/// a DRM device, that is the bare screen: Saule Linux, where the program
+/// itself is the display. `SHINE_BACKEND=console` or `desktop` overrides the
+/// guess.
+fn open_backend(
+    title: &str,
+    width: usize,
+    height: usize,
+    resizable: bool,
+) -> Result<Box<dyn Backend>, String> {
+    #[cfg(target_os = "linux")]
+    if console::wanted() {
+        return Ok(Box::new(console::Console::open()?));
+    }
+    Ok(Box::new(desktop::Desktop::open(
+        title, width, height, resizable,
+    )?))
 }
 
 /// A resource whose last Saule reference is gone, waiting to be freed.

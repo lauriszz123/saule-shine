@@ -17,7 +17,7 @@
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
-use minifb::{InputCallback, Key, Window};
+use minifb::{InputCallback, Key};
 use saule_sdk::prelude::*;
 use saule_sdk::saule_export;
 
@@ -342,13 +342,13 @@ impl Default for KeyState {
 
 impl KeyState {
     /// Latch this frame's key states. Called once per `Window.pollEvents`.
-    pub fn sync(&mut self, window: &Window) {
+    pub fn sync(&mut self, held: &[Key]) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_sync).as_secs_f32();
         self.last_sync = now;
 
         self.down = [false; KEY_SLOTS];
-        for key in window.get_keys() {
+        for &key in held {
             let i = key as usize;
             if i < KEY_SLOTS {
                 self.down[i] = true;

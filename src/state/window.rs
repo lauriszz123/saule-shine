@@ -1,9 +1,9 @@
-//! The OS window and the frame loop: opening, sizing, presenting,
-//! and the per-platform DPI scale queries that back them.
+//! The window and the frame loop: sizing, presenting, and pacing. What the
+//! frames are shown on is the [`super::backend::Backend`].
 
 mod input;
 
-use minifb::{Key, Window};
+use minifb::Key;
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -11,90 +11,6 @@ use super::*;
 /// How long an unchanged frame may go without being re-sent to the window.
 /// See [`Engine::present`].
 const FORCE_BLIT_EVERY: Duration = Duration::from_millis(500);
-
-/// Ask the OS for this window's scale factor, with 1.0 meaning "96 DPI".
-///
-/// minifb has no DPI query, so this goes through the native window handle.
-/// Only Windows is wired up; the others report 1.0 rather than guessing, which
-/// at least makes the limitation visible instead of subtly wrong.
-///
-#[cfg(windows)]
-pub(crate) fn query_scale(window: &Window) -> f64 {
-    let handle = window.get_window_handle();
-
-    if handle.is_null() {
-        return 1.0;
-    }
-
-    // Safety: the handle is minifb's live HWND, and `GetDpiForWindow` only
-    // reads from it.
-    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(handle as _) };
-
-    if dpi == 0 {
-        return 1.0;
-    }
-
-    f64::from(dpi) / 96.0
-}
-
-/// Ask the NSWindow for its Retina backing scale.
-///
-/// minifb has no DPI query and its own macOS `scale_factor` is the integer
-/// window magnification from [`minifb::Scale`], unrelated to this — so the
-/// engine used to report `1.0` here and draw a point-resolution framebuffer
-/// that the OS then magnified. On a Retina display that is a soft, visibly
-/// pixelated UI, worst of all in text.
-///
-/// The backend can do better than that: it presents the framebuffer as a Metal
-/// texture on an `MTKView`, whose drawable is already sized in *physical*
-/// pixels. Handing it a framebuffer at physical resolution (see
-/// [`Engine::backing_scale`]) makes that mapping 1:1 instead of a 2× upscale.
-///
-/// `mfb_open` returns an `OSXWindow`, which is an `NSWindow` subclass, so this
-/// is a plain `backingScaleFactor` message. It goes through the Objective-C
-/// runtime directly rather than pulling in an `objc` crate for one selector.
-#[cfg(target_os = "macos")]
-pub(crate) fn query_scale(window: &Window) -> f64 {
-    use std::ffi::{c_char, c_void};
-
-    unsafe extern "C" {
-        fn sel_registerName(name: *const c_char) -> *const c_void;
-        fn objc_msgSend();
-    }
-
-    let handle = window.get_window_handle();
-    if handle.is_null() {
-        return 1.0;
-    }
-
-    // Safety: `handle` is minifb's live `OSXWindow*` (an `NSWindow`), and
-    // `backingScaleFactor` is a no-argument property getter returning CGFloat.
-    // `objc_msgSend` has no single Rust type, so it is transmuted to the exact
-    // signature of the call being made — which is what the ABI requires on
-    // aarch64, where a mismatched cast would pass arguments in the wrong
-    // registers.
-    let scale = unsafe {
-        let sel = sel_registerName(c"backingScaleFactor".as_ptr());
-        if sel.is_null() {
-            return 1.0;
-        }
-        let send: extern "C" fn(*mut c_void, *const c_void) -> f64 =
-            std::mem::transmute(objc_msgSend as *const ());
-        send(handle, sel)
-    };
-
-    // A window that is not on a screen yet can answer 0.
-    if scale.is_finite() && scale >= 1.0 {
-        scale
-    } else {
-        1.0
-    }
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-pub(crate) fn query_scale(_window: &Window) -> f64 {
-    1.0
-}
 
 /// Opt the process into per-monitor DPI awareness before any window exists.
 ///
@@ -124,24 +40,6 @@ pub(crate) fn declare_dpi_aware() {
 #[cfg(not(windows))]
 pub(crate) fn declare_dpi_aware() {}
 
-/// Framebuffer pixels per unit of the size and pointer coordinates minifb
-/// reports, given the display's scale factor.
-///
-/// On macOS minifb works in *points*, so this is the Retina backing scale and
-/// the framebuffer is allocated that much larger. On Windows the process is
-/// per-monitor DPI aware and minifb already reports physical pixels, so
-/// scaling again would double-count; X11 does no scaling here at all. Both are
-/// therefore `1.0` regardless of what `getScale()` reports.
-#[cfg(target_os = "macos")]
-pub(crate) fn backing_scale_for(scale: f64) -> f64 {
-    scale
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn backing_scale_for(_scale: f64) -> f64 {
-    1.0
-}
-
 /// Frame budget a fresh window starts with — 60 FPS.
 pub(crate) const DEFAULT_FRAME_DUR: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
@@ -154,7 +52,8 @@ impl Engine {
     /// autocomplete popup is dismissed — and the app has no way to decline the
     /// engine's quit. The `Closed` event covers the real close.
     pub fn is_open(&self) -> bool {
-        self.window.is_open() && !(self.quit_on_escape && self.window.is_key_down(Key::Escape))
+        self.backend.is_open()
+            && !(self.quit_on_escape && self.backend.is_key_down(Key::Escape))
     }
 
     pub fn set_quit_on_escape(&mut self, enable: bool) {
@@ -205,15 +104,9 @@ impl Engine {
     }
 
     /// How many framebuffer pixels there are per unit of the size and pointer
-    /// coordinates minifb reports.
-    ///
-    /// On macOS minifb works in *points*, so this is the Retina backing scale
-    /// and the framebuffer is allocated that much larger. On Windows the
-    /// process is per-monitor DPI aware and minifb already reports physical
-    /// pixels, so scaling again would double-count; X11 has no scaling here at
-    /// all. Both of those are therefore `1.0` regardless of `getScale()`.
+    /// coordinates the backend reports (see [`Backend::backing_scale`]).
     pub(crate) fn backing_scale(&self) -> f64 {
-        backing_scale_for(self.scale)
+        self.backend.backing_scale()
     }
 
     /// Match the framebuffer to the window, and refresh the scale factor.
@@ -228,9 +121,9 @@ impl Engine {
         // Read the scale first: the framebuffer size depends on it, so a window
         // dragged onto a denser monitor has to be re-sized in the same pass
         // that notices the density changed.
-        self.scale = query_scale(&self.window);
+        self.scale = self.backend.scale();
 
-        let (points_w, points_h) = self.window.get_size();
+        let (points_w, points_h) = self.backend.size();
         let backing = self.backing_scale();
         let w = (points_w as f64 * backing).round() as usize;
         let h = (points_h as f64 * backing).round() as usize;
@@ -246,27 +139,25 @@ impl Engine {
     }
 
     pub fn set_title(&mut self, title: &str) {
-        self.window.set_title(title);
+        self.backend.set_title(title);
     }
 
     pub fn position(&self) -> (i64, i64) {
-        let (x, y) = self.window.get_position();
-
-        (x as i64, y as i64)
+        self.backend.position()
     }
 
     pub fn set_position(&mut self, x: i64, y: i64) {
-        self.window.set_position(x as isize, y as isize);
+        self.backend.set_position(x, y);
     }
 
     pub fn set_topmost(&mut self, topmost: bool) {
-        self.window.topmost(topmost);
+        self.backend.set_topmost(topmost);
     }
 
     /// Whether the window has keyboard focus. A background app should usually
     /// stop animating.
     pub fn is_focused(&mut self) -> bool {
-        self.window.is_active()
+        self.backend.is_active()
     }
 
     /// Present the framebuffer to the window, then sleep until the next frame
@@ -283,19 +174,13 @@ impl Engine {
         // half of what presenting is for.
         let stale = self.last_blit.elapsed() >= FORCE_BLIT_EVERY;
 
-        if self.r.screen_dirty || stale {
-            if !self.present_shared() {
-                // Split the borrow so `update_with_buffer` can take
-                // `&mut window` and `&buffer` at once.
-                let Engine { window, r, .. } = self;
-                window
-                    .update_with_buffer(&r.screen.buf, r.screen.w, r.screen.h)
-                    .map_err(|e| format!("Graphics.present: {e}"))?;
-            }
+        if self.r.screen_dirty || stale || self.backend.wants_present() {
+            let Engine { backend, r, .. } = self;
+            backend.present(&r.screen.buf, r.screen.w, r.screen.h)?;
             self.r.screen_dirty = false;
             self.last_blit = Instant::now();
         } else {
-            self.window.update();
+            self.backend.pump();
         }
 
         crate::timer::mark_frame();
@@ -305,7 +190,8 @@ impl Engine {
         // a wheel notch that arrived mid-frame from being wiped before
         // `pollEvents` gets to read it. Keys need no equivalent: their edges
         // are latched in the backend's callback as the messages arrive.
-        self.mouse.observe(&self.window);
+        self.mouse
+            .observe(self.backend.mouse_buttons(), self.backend.wheel());
 
         let Some(budget) = self.frame_dur else {
             return Ok(()); // uncapped: present and go straight back round
@@ -325,34 +211,5 @@ impl Engine {
             self.next_frame = now + budget;
         }
         Ok(())
-    }
-}
-
-impl Engine {
-    /// Put the framebuffer on screen through shared memory, then pump the
-    /// window's events. `false` when that path is unavailable — never set
-    /// up, or found not to work, in which case it is dropped for good and
-    /// minifb presents from here on.
-    #[cfg(target_os = "linux")]
-    fn present_shared(&mut self) -> bool {
-        let Some(shm) = self.shm.as_mut() else {
-            return false;
-        };
-
-        if !shm.present(&self.r.screen.buf, self.r.screen.w, self.r.screen.h) {
-            if std::env::var_os("SHINE_TRACE_PRESENT").is_some() {
-                eprintln!("shine: shared memory failed, presenting through minifb");
-            }
-            self.shm = None;
-            return false;
-        }
-
-        self.window.update();
-        true
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn present_shared(&mut self) -> bool {
-        false
     }
 }
