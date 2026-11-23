@@ -15,6 +15,7 @@ pub(crate) const SUBSAMPLES: usize = 4;
 /// The window's framebuffer ignores the alpha byte (minifb only reads `0RGB`),
 /// but canvases keep it meaningful so a canvas can be composited back over the
 /// screen with real transparency.
+#[derive(Clone)]
 pub struct Surface {
     pub buf: Vec<u32>,
     pub w: usize,

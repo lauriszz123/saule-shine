@@ -82,6 +82,57 @@ impl Image {
     pub fn save(&self, path: &str) -> Result<(), String> {
         state::draw(|gfx| gfx.save_image(self.handle, path))?
     }
+
+    // --- Pixels -------------------------------------------------------------
+    //
+    // Colours are packed `0xAARRGGBB`, straight alpha. Every write *replaces*
+    // the pixel, alpha included — painting `0` erases. Coordinates outside
+    // the image are ignored rather than an error, so a brush can run off the
+    // edge.
+
+    /// The colour at `x, y`, or `0` (transparent) outside the image.
+    pub fn get_pixel(&self, x: i64, y: i64) -> Result<i64, String> {
+        Ok(state::draw(|gfx| gfx.get_pixel(self.handle, x, y))?? as i64)
+    }
+
+    /// Set the pixel at `x, y` to `argb`.
+    pub fn set_pixel(&self, x: i64, y: i64, argb: i64) -> Result<(), String> {
+        state::draw(|gfx| gfx.set_pixel(self.handle, x, y, argb as u32))?
+    }
+
+    /// Fill a `w × h` rectangle at `x, y` with `argb`. A negative size runs
+    /// back from `x, y`.
+    pub fn fill_rect(&self, x: i64, y: i64, w: i64, h: i64, argb: i64) -> Result<(), String> {
+        state::draw(|gfx| gfx.fill_rect(self.handle, x, y, w, h, argb as u32))?
+    }
+
+    /// A one-pixel line between two pixels, both ends included.
+    pub fn draw_line(&self, x0: i64, y0: i64, x1: i64, y1: i64, argb: i64) -> Result<(), String> {
+        state::draw(|gfx| gfx.line_pixels(self.handle, x0, y0, x1, y1, argb as u32))?
+    }
+
+    /// Repaint the connected area of the colour at `x, y` with `argb`, and
+    /// say how many pixels changed.
+    pub fn flood_fill(&self, x: i64, y: i64, argb: i64) -> Result<i64, String> {
+        state::draw(|gfx| gfx.flood_fill(self.handle, x, y, argb as u32))?
+    }
+
+    /// A new image with a copy of these pixels.
+    pub fn copy(&self) -> Result<Image, String> {
+        let handle = state::draw(|gfx| gfx.copy_image(self.handle))??;
+        Image::from_handle(handle)
+    }
+
+    /// A new image of the `w × h` region at `x, y`.
+    pub fn crop(&self, x: i64, y: i64, w: i64, h: i64) -> Result<Image, String> {
+        let handle = state::draw(|gfx| gfx.crop_image(self.handle, x, y, w, h))??;
+        Image::from_handle(handle)
+    }
+
+    /// Overwrite these pixels with `other`'s, which must be the same size.
+    pub fn replace_pixels(&self, other: &Image) -> Result<(), String> {
+        state::draw(|gfx| gfx.replace_pixels(self.handle, other.handle))?
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +296,14 @@ impl Quad {
 #[saule_export(class = "Graphics", name = "newImage")]
 fn graphics_new_image(path: String) -> Result<Image, String> {
     let handle = state::draw(|gfx| gfx.new_image(&path))??;
+    Image::from_handle(handle)
+}
+
+/// `Graphics.newBlankImage(width, height)` — a fully transparent image, to
+/// paint on with the `Image` pixel methods.
+#[saule_export(class = "Graphics", name = "newBlankImage")]
+fn graphics_new_blank_image(width: i64, height: i64) -> Result<Image, String> {
+    let handle = state::draw(|gfx| gfx.new_blank_image(width, height))??;
     Image::from_handle(handle)
 }
 

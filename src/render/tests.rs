@@ -714,3 +714,103 @@ fn steady_text_allocates_nothing() {
     let steady = crate::counting_allocator::count(|| draw(&mut r));
     assert_eq!(steady, 0, "steady text allocated {steady} time(s)");
 }
+
+// ---------------------------------------------------------------------------
+// Pixel editing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pixels_are_read_and_written_exactly() {
+    let mut r = renderer(4, 4);
+    let img = r.new_blank_image(3, 3).expect("blank");
+    assert_eq!(
+        r.get_pixel(img, 1, 1).unwrap(),
+        0,
+        "a blank image is transparent"
+    );
+
+    r.set_pixel(img, 1, 1, 0x80FF_0000).unwrap();
+    assert_eq!(
+        r.get_pixel(img, 1, 1).unwrap(),
+        0x80FF_0000,
+        "no blending, alpha kept"
+    );
+
+    // Off the edge is ignored, not an error, and reads as transparent.
+    r.set_pixel(img, 9, -1, 0xFFFF_FFFF).unwrap();
+    assert_eq!(r.get_pixel(img, 9, -1).unwrap(), 0);
+}
+
+#[test]
+fn a_line_covers_both_ends_without_gaps() {
+    let mut r = renderer(4, 4);
+    let img = r.new_blank_image(8, 8).expect("blank");
+    r.line_pixels(img, 0, 0, 7, 3, 0xFF00_00FF).unwrap();
+
+    assert_eq!(r.get_pixel(img, 0, 0).unwrap(), 0xFF00_00FF);
+    assert_eq!(r.get_pixel(img, 7, 3).unwrap(), 0xFF00_00FF);
+    // A shallow line touches exactly one pixel per column.
+    for x in 0..8 {
+        let hits = (0..8)
+            .filter(|&y| r.get_pixel(img, x, y).unwrap() != 0)
+            .count();
+        assert_eq!(hits, 1, "column {x}");
+    }
+}
+
+#[test]
+fn flood_fill_stops_at_a_different_colour() {
+    let mut r = renderer(4, 4);
+    let img = r.new_blank_image(5, 5).expect("blank");
+    // A wall down column 2 splits the image in two.
+    r.fill_rect(img, 2, 0, 1, 5, 0xFF00_0000).unwrap();
+
+    let changed = r.flood_fill(img, 0, 0, 0xFFFF_FFFF).unwrap();
+    assert_eq!(changed, 10, "the 2x5 area left of the wall");
+    assert_eq!(
+        r.get_pixel(img, 4, 4).unwrap(),
+        0,
+        "the far side is untouched"
+    );
+    assert_eq!(
+        r.flood_fill(img, 0, 0, 0xFFFF_FFFF).unwrap(),
+        0,
+        "already that colour"
+    );
+}
+
+#[test]
+fn a_negative_rectangle_fills_back_from_its_corner() {
+    let mut r = renderer(4, 4);
+    let img = r.new_blank_image(4, 4).expect("blank");
+    r.fill_rect(img, 3, 3, -2, -2, 0xFF11_2233).unwrap();
+    assert_eq!(r.get_pixel(img, 1, 1).unwrap(), 0xFF11_2233);
+    assert_eq!(r.get_pixel(img, 2, 2).unwrap(), 0xFF11_2233);
+    assert_eq!(
+        r.get_pixel(img, 3, 3).unwrap(),
+        0,
+        "the far edge is exclusive"
+    );
+}
+
+#[test]
+fn copies_crops_and_replacing_round_trip() {
+    let mut r = renderer(4, 4);
+    let img = r.new_blank_image(4, 2).expect("blank");
+    r.set_pixel(img, 3, 1, 0xFFAB_CDEF).unwrap();
+
+    let snapshot = r.copy_image(img).unwrap();
+    r.set_pixel(img, 3, 1, 0).unwrap();
+    r.replace_pixels(img, snapshot).unwrap();
+    assert_eq!(
+        r.get_pixel(img, 3, 1).unwrap(),
+        0xFFAB_CDEF,
+        "the snapshot came back"
+    );
+
+    let cell = r.crop_image(img, 2, 0, 2, 2).unwrap();
+    assert_eq!(r.image_size(cell).unwrap(), (2, 2));
+    assert_eq!(r.get_pixel(cell, 1, 1).unwrap(), 0xFFAB_CDEF);
+
+    assert!(r.replace_pixels(img, cell).is_err(), "sizes must match");
+}

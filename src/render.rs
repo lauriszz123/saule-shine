@@ -12,6 +12,7 @@
 
 mod canvas;
 mod draw;
+mod pixels;
 mod scratch;
 mod text;
 
