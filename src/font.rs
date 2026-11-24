@@ -45,7 +45,8 @@ pub struct Glyph {
 /// A loaded typeface at one fixed point size — the equivalent of a Love2D
 /// `Font` object.
 pub struct FontRes {
-    face: Font,
+    /// Shared with every other size of the same file: see [`shared_face`].
+    face: Arc<Font>,
     size: f32,
     ascent: f64,
     line_height: f64,
@@ -53,10 +54,19 @@ pub struct FontRes {
 }
 
 impl FontRes {
-    pub fn from_bytes(bytes: &[u8], size: f64) -> Result<Self, String> {
+    /// The face in the file at `path`, at `size`. The file is read and
+    /// parsed the first time only: every size after takes the same parse.
+    pub fn from_file(path: &str, size: f64) -> Result<Self, String> {
         let size = size.clamp(1.0, 512.0) as f32;
-        let face = parse_face(bytes, size)?;
+        if size > SHARED_LIMIT {
+            // Too large for the shared parse to draw well: one of its own.
+            let face = Arc::new(parse_face(&read_font(path)?, size)?);
+            return Ok(Self::with_face(face, size));
+        }
+        Ok(Self::with_face(shared_face(path)?, size))
+    }
 
+    fn with_face(face: Arc<Font>, size: f32) -> Self {
         // `horizontal_line_metrics` is absent on fonts without an `hhea`
         // table; fall back to the usual 80/20 split of the em box.
         let (ascent, line_height) = match face.horizontal_line_metrics(size) {
@@ -67,19 +77,13 @@ impl FontRes {
             None => (size as f64 * 0.8, size as f64 * 1.2),
         };
 
-        Ok(FontRes {
+        FontRes {
             face,
             size,
             ascent,
             line_height,
             cache: HashMap::new(),
-        })
-    }
-
-    pub fn from_file(path: &str, size: f64) -> Result<Self, String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("could not read font `{path}`: {e}"))?;
-        Self::from_bytes(&bytes, size)
+        }
     }
 
     /// Distance from the top of a line to its baseline.
@@ -104,7 +108,7 @@ impl FontRes {
         // only a genuine miss consults the chain, and a miss everywhere falls
         // back to the primary's `.notdef` so something visible is drawn.
         let fallback;
-        let source = if self.face.has_glyph(ch) {
+        let source: &Font = if self.face.has_glyph(ch) {
             &self.face
         } else {
             fallback = fallback_for(ch);
@@ -289,15 +293,47 @@ fn parse_face(bytes: &[u8], size: f32) -> Result<Font, String> {
     Font::from_bytes(bytes, settings).map_err(|e| format!("could not parse font: {e}"))
 }
 
+fn read_font(path: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("could not read font `{path}`: {e}"))
+}
+
+/// The size shared faces are parsed for, and the largest size drawn from
+/// one. fontdue fits a face's curves to the size it is parsed for: smaller
+/// text drawn from it looks the same, larger text shows the fit, so the
+/// parse is for large text (a lock screen's clock) and anything well past
+/// it gets a parse of its own.
+const SHARED_SCALE: f32 = 96.0;
+const SHARED_LIMIT: f32 = 144.0;
+
+/// The faces parsed so far, by file.
+static FACES: Mutex<Vec<(String, Arc<Font>)>> = Mutex::new(Vec::new());
+
+/// The face in the file at `path`, parsed the first time it is asked for
+/// and shared from then on.
+///
+/// Parsing reads every outline in the file, whatever is drawn after: a UI
+/// face is thousands of glyphs, a few hundredths of a second on a desktop
+/// and a third of a second on a netbook. A font object is a face *at a
+/// size*, and a UI asks for a handful of sizes, each of which used to parse
+/// the file again — a pause the first time a menu, a dialog or a lock
+/// screen showed text at a size not seen before. Rasterizing takes the size
+/// it draws at, so one parse serves them all.
+fn shared_face(path: &str) -> Result<Arc<Font>, String> {
+    let mut faces = FACES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, face)) = faces.iter().find(|(file, _)| file == path) {
+        return Ok(face.clone());
+    }
+    let face = Arc::new(parse_face(&read_font(path)?, SHARED_SCALE)?);
+    faces.push((path.to_string(), face.clone()));
+    Ok(face)
+}
+
 /// The host's fallback faces, in [`fallback_candidates`] order, as far as they
 /// have been needed: `None` for a file that is missing or doesn't parse.
 static FALLBACKS: Mutex<Vec<Option<Arc<Font>>>> = Mutex::new(Vec::new());
 
 /// The first fallback face that has `ch`, parsing further faces only when
 /// the ones already parsed lack it.
-///
-/// Faces are kept at the default optimisation size: one parse serves every
-/// size, since rasterizing takes the size it draws at.
 fn fallback_for(ch: char) -> Option<Arc<Font>> {
     fallback_from(fallback_candidates(), &FALLBACKS, ch)
 }
@@ -312,10 +348,10 @@ fn fallback_from(
         return Some(face.clone());
     }
     while chain.len() < candidates.len() {
-        let face = std::fs::read(candidates[chain.len()])
-            .ok()
-            .and_then(|bytes| parse_face(&bytes, DEFAULT_SIZE as f32).ok())
-            .map(Arc::new);
+        // The shared parse: a fallback may be the very file the UI's own
+        // face came from (a symbol no face has ends up asking them all),
+        // and that must not parse it a second time.
+        let face = shared_face(candidates[chain.len()]).ok();
         let found = face.as_ref().is_some_and(|f| f.has_glyph(ch));
         chain.push(face.clone());
         if found {
@@ -476,14 +512,9 @@ fn no_break_after(ch: char) -> bool {
 /// Returns `None` when nothing suitable is installed, in which case text calls
 /// report an actionable error pointing at `Graphics.newFont`.
 pub fn load_default(size: f64) -> Option<FontRes> {
-    for path in default_font_candidates() {
-        if let Ok(bytes) = std::fs::read(path)
-            && let Ok(font) = FontRes::from_bytes(&bytes, size)
-        {
-            return Some(font);
-        }
-    }
-    None
+    default_font_candidates()
+        .iter()
+        .find_map(|path| FontRes::from_file(path, size).ok())
 }
 
 fn default_font_candidates() -> &'static [&'static str] {
@@ -634,6 +665,24 @@ mod tests {
     /// with no fonts installed (bare CI containers).
     fn font(size: f64) -> Option<FontRes> {
         load_default(size)
+    }
+
+    #[test]
+    fn every_size_of_a_file_shares_one_parse() {
+        let (Some(small), Some(large)) = (font(12.0), font(72.0)) else {
+            return;
+        };
+        assert!(Arc::ptr_eq(&small.face, &large.face));
+        // Each still measures at its own size.
+        assert!(large.height() > small.height() * 4.0);
+    }
+
+    #[test]
+    fn text_too_large_for_the_shared_parse_gets_its_own() {
+        let (Some(small), Some(huge)) = (font(12.0), font(300.0)) else {
+            return;
+        };
+        assert!(!Arc::ptr_eq(&small.face, &huge.face));
     }
 
     #[test]

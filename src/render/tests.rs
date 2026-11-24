@@ -901,6 +901,43 @@ fn an_outline_drawn_in_pieces_matches_the_path() {
 }
 
 #[test]
+fn a_rounded_fill_drawn_in_pieces_matches_the_path() {
+    // Cards and panels, on and off whole pixels, see-through and solid,
+    // moved and scaled, cut by a scissor: the pieces draw what the one
+    // path did.
+    let cases = [
+        (10.0, 10.0, 120.0, 90.0, 10.0, 1.0, 1.0),
+        (10.5, 10.25, 119.0, 89.5, 10.0, 0.7, 1.0),
+        (4.0, 6.0, 140.0, 100.0, 24.5, 0.06, 1.0),
+        (3.3, 2.7, 70.0, 50.0, 6.0, 0.5, 2.0),
+        (8.0, 8.0, 80.0, 64.0, 32.0, 0.9, 1.5),
+    ];
+    for (x, y, w, h, radius, alpha, scale) in cases {
+        for scissor in [None, Some((20.0, 15.0, 90.0, 70.0))] {
+            let draw = |pieces: bool| {
+                let mut r = renderer(160, 120);
+                r.set_scissor(scissor);
+                r.scale(scale, scale);
+                r.set_color(0.9, 0.5, 0.2, alpha);
+                if pieces {
+                    r.rectangle("fill", x, y, w, h, radius, radius).expect("pieces");
+                } else {
+                    r.rectangle_path("fill", x, y, w, h, radius, radius).expect("path");
+                }
+                r
+            };
+            let (pieces, path) = (draw(true), draw(false));
+            assert!(pieces.written() > 0, "nothing drawn for {x} {y} {w} {h} r{radius}");
+            let (worst, off) = screen_delta(&pieces, &path, 2);
+            assert!(
+                off == 0,
+                "{x} {y} {w} {h} r{radius} a{alpha} s{scale} {scissor:?}: {off} pixels off, worst by {worst}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_turned_outline_is_still_drawn() {
     let mut r = renderer(80, 80);
     r.rotate(0.3);

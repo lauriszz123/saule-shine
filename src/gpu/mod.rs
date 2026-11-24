@@ -240,9 +240,10 @@ pub(crate) enum Cover<'a> {
         bytes: &'a [u8],
     },
     /// Coverage kept in the shape atlas, at `corner` there, for the box at
-    /// `origin` (see [`keep_shape`]).
+    /// `origin` (see [`keep_shape`]), which may lie partly off the target:
+    /// the area filled is what cuts it.
     Kept {
-        origin: (usize, usize),
+        origin: (i64, i64),
         corner: (usize, usize),
     },
 }

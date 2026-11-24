@@ -442,7 +442,92 @@ impl Renderer {
         if mode == "line" && self.outline_in_pieces(x, y, w, h, rx, ry)? {
             return Ok(());
         }
+        if mode == "fill" && self.rounded_fill_in_pieces(x, y, w, h, rx, ry)? {
+            return Ok(());
+        }
         self.rectangle_path(mode, x, y, w, h, rx, ry)
+    }
+
+    /// A large `rectangle("fill", …)` with rounded corners drawn in pieces:
+    /// three plain rectangles (the middle from side to side, and what is
+    /// above and below it between the corners) and the path itself only in
+    /// the four corners.
+    ///
+    /// A rounded rectangle is most of what a UI draws — every card, panel
+    /// and window — and as one path its coverage is worked out pixel by
+    /// pixel on the CPU, all of it, though only its corners are anything
+    /// but full. A plain rectangle needs none of that (the GPU works its
+    /// coverage out itself; the CPU has a fast path), and a corner is a few
+    /// dozen pixels, so a card costs its corners rather than its area: the
+    /// first time one of a new size is drawn — a pane opening, a window
+    /// being resized — no longer stops for it.
+    ///
+    /// The pixels are the path's own, as with `outline_in_pieces`: the
+    /// pieces meet on whole pixels, so none is drawn by two.
+    ///
+    /// Only for one large enough to be worth seven draws for one, in a
+    /// plain colour, while the transform moves and scales; returns whether
+    /// it drew, and if not, the caller draws the path.
+    fn rounded_fill_in_pieces(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        rx: f64,
+        ry: f64,
+    ) -> Result<bool, String> {
+        /// The area, in pixels, from which pieces are worth it.
+        const LARGE: f64 = 64.0 * 64.0;
+
+        let t = self.st.transform;
+        if t.b != 0.0 || t.c != 0.0 || t.a <= 0.0 || t.d <= 0.0 || self.st.gradient.is_some() {
+            return Ok(false);
+        }
+        let (x, w) = if w < 0.0 { (x + w, -w) } else { (x, w) };
+        let (y, h) = if h < 0.0 { (y + h, -h) } else { (y, h) };
+        // The same clamping `rounded_rect_path_into` does: a radius only
+        // counts when both are set.
+        let (rx, ry) = (rx.abs().min(w * 0.5), ry.abs().min(h * 0.5));
+        if rx <= 0.0 || ry <= 0.0 {
+            return Ok(false);
+        }
+
+        let (left, top) = t.apply(x, y);
+        let (right, bottom) = t.apply(x + w, y + h);
+        if (right - left) * (bottom - top) < LARGE {
+            return Ok(false);
+        }
+        // Where the sides are straight: past the curves, on whole pixels.
+        let x0 = (left + rx * t.a).ceil();
+        let x1 = (right - rx * t.a).floor();
+        let y0 = (top + ry * t.d).ceil();
+        let y1 = (bottom - ry * t.d).floor();
+        if x0 >= x1 || y0 >= y1 {
+            return Ok(false);
+        }
+
+        self.fill_device(left, y0, right, y1)?;
+        self.fill_device(x0, top, x1, y0)?;
+        self.fill_device(x0, y1, x1, bottom)?;
+
+        let far = f64::INFINITY;
+        let corners = [
+            Rect { x0: -far, y0: -far, x1: x0, y1: y0 },
+            Rect { x0: x1, y0: -far, x1: far, y1: y0 },
+            Rect { x0: x1, y0: y1, x1: far, y1: far },
+            Rect { x0: -far, y0: y1, x1: x0, y1: far },
+        ];
+        let scissor = self.st.scissor;
+        let (tw, th) = self.target_size();
+        let within = scissor.unwrap_or(Rect::surface(tw, th));
+        for corner in corners {
+            self.st.scissor = Some(within.intersect(&corner));
+            let drawn = self.rectangle_path("fill", x, y, w, h, rx, ry);
+            self.st.scissor = scissor;
+            drawn?;
+        }
+        Ok(true)
     }
 
     /// `rectangle` the general way: the whole outline as one path through

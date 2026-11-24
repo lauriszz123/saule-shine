@@ -13,12 +13,30 @@
 //!   Saule code, and the native calls that aren't drawing;
 //! - **idle**: the pacing sleep that holds the loop to its target rate.
 //!
+//! An average hides the one frame that froze the screen — a picture decoded
+//! or a shader compiled the first time it was needed — so any frame whose
+//! work took longer than a tenth of a second is also reported on its own,
+//! as it happens:
+//!
+//! ```text
+//! shine 71: slow call 1694 ms at src/api/graphics.rs:412
+//! shine 71: slow frame 1840 ms = draw 1702 + present 21 + program 117 · objects.rs:344 1694 ms in 1
+//! ```
+//!
+//! with the `Graphics` functions most of its drawing went to (the time in
+//! each and the number of calls), and how many shapes had their coverage
+//! worked out on the CPU. So is the one drawing call that took most of it (30 ms or more),
+//! by where in Shine's `Graphics` it is. The GPU draws shapes in batches,
+//! so the call named may be the one that sent a batch off rather than the
+//! one that filled it.
+//!
 //! `SHINE_TRACE_FRAMES=/some/file` appends there instead, for a program
 //! whose stderr isn't a terminal: an app a display server started.
 //!
 //! Off unless the variable is set; when off, each hook is one cached check.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -73,25 +91,72 @@ const ZERO: Totals = Totals {
     idle: Duration::ZERO,
 };
 
+/// Time and calls, by where in `Graphics` the call is (file and line).
+type Calls = HashMap<(&'static str, u32), (Duration, u32)>;
+
+/// A frame whose work (everything but the pacing sleep) takes this long is
+/// reported on its own.
+const SLOW_FRAME: Duration = Duration::from_millis(100);
+
 thread_local! {
     static TOTALS: Cell<Totals> = const { Cell::new(ZERO) };
     static SINCE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// When the frame being made began, and the drawing done in it so far.
+    static FRAME_BEGAN: Cell<Option<Instant>> = const { Cell::new(None) };
+    static FRAME_DRAW: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    /// The drawing of the frame being made, by which `Graphics` function it
+    /// was: the time in each, and how many calls.
+    static FRAME_CALLS: RefCell<Calls> = RefCell::new(HashMap::new());
+    /// Shapes whose coverage the CPU worked out in this frame, and the
+    /// pixels of them: what the GPU's shape atlas is there to avoid.
+    static FRAME_MASKS: Cell<(u32, u64)> = const { Cell::new((0, 0)) };
 }
 
-/// Time `f` as drawing.
-pub(crate) fn drawing<R>(f: impl FnOnce() -> R) -> R {
+/// A single drawing call that takes this long is reported on its own.
+const SLOW_CALL: Duration = Duration::from_millis(30);
+
+/// Time `f` as drawing; `caller` is the `Graphics.*` function it is.
+pub(crate) fn drawing<R>(caller: &'static std::panic::Location<'static>, f: impl FnOnce() -> R) -> R {
     if !enabled() {
         return f();
     }
     let start = Instant::now();
     let out = f();
     let took = start.elapsed();
+    if took >= SLOW_CALL {
+        report(&format!(
+            "shine {}: slow call {:.0} ms at {}:{}",
+            std::process::id(),
+            took.as_secs_f64() * 1000.0,
+            caller.file(),
+            caller.line()
+        ));
+    }
     TOTALS.with(|t| {
         let mut v = t.get();
         v.draw += took;
         t.set(v);
     });
+    FRAME_DRAW.with(|d| d.set(d.get() + took));
+    FRAME_CALLS.with(|calls| {
+        let mut calls = calls.borrow_mut();
+        let entry = calls.entry((caller.file(), caller.line())).or_default();
+        entry.0 += took;
+        entry.1 += 1;
+    });
     out
+}
+
+/// The CPU worked out the coverage of a shape of `pixels` pixels, for the
+/// GPU to blend: one the shape atlas did not have.
+pub(crate) fn covered(pixels: usize) {
+    if !enabled() {
+        return;
+    }
+    FRAME_MASKS.with(|m| {
+        let (shapes, total) = m.get();
+        m.set((shapes + 1, total + pixels as u64));
+    });
 }
 
 /// A surface was copied up to the GPU (`up`) or read back from it: the
@@ -130,6 +195,7 @@ pub(crate) fn frame(present: Duration, idle: Duration) {
         return;
     }
     let now = Instant::now();
+    slow_frame(now, present, idle);
     let since = SINCE.with(|s| *s.get().get_or_insert(now));
     SINCE.with(|s| {
         if s.get().is_none() {
@@ -173,4 +239,39 @@ pub(crate) fn frame(present: Duration, idle: Duration) {
         SINCE.with(|s| s.set(Some(now)));
     }
     TOTALS.with(|t| t.set(v));
+}
+
+/// Report the frame that just ended, by itself, if its work took long.
+fn slow_frame(now: Instant, present: Duration, idle: Duration) {
+    let began = FRAME_BEGAN.with(|b| b.replace(Some(now)));
+    let draw = FRAME_DRAW.with(|d| d.replace(Duration::ZERO));
+    let mut calls: Vec<_> = FRAME_CALLS.with(|c| c.borrow_mut().drain().collect());
+    let (masks, mask_pixels) = FRAME_MASKS.with(|m| m.replace((0, 0)));
+    let Some(began) = began else {
+        return;
+    };
+    let work = now.duration_since(began).saturating_sub(idle);
+    if work < SLOW_FRAME {
+        return;
+    }
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let program = work.saturating_sub(draw).saturating_sub(present);
+    // Where the drawing went: the few functions that took most of it.
+    calls.sort_by_key(|&(_, (took, _))| std::cmp::Reverse(took));
+    let mut most = String::new();
+    for ((file, line), (took, count)) in calls.into_iter().take(4) {
+        let file = file.rsplit('/').next().unwrap_or(file);
+        most.push_str(&format!(" · {file}:{line} {:.0} ms in {count}", ms(took)));
+    }
+    if masks > 0 {
+        most.push_str(&format!(" · {masks} shapes covered on the CPU ({mask_pixels} px)"));
+    }
+    report(&format!(
+        "shine {}: slow frame {:.0} ms = draw {:.0} + present {:.0} + program {:.0}{most}",
+        std::process::id(),
+        ms(work),
+        ms(draw),
+        ms(present),
+        ms(program)
+    ));
 }

@@ -176,6 +176,33 @@ impl Texture {
         }
     }
 
+    /// Copy the `w` × `h` pixels at the texture's corner back into `buf`:
+    /// all of it, for a texture that size, or the frame in a buffer made
+    /// larger than its window.
+    pub(crate) fn read_corner(&self, buf: &mut [u32], w: usize, h: usize) {
+        let (w, h) = (w.min(self.w), h.min(self.h));
+        if (w, h) == (self.w, self.h) {
+            return self.read(buf);
+        }
+        super::batch::flush(&self.dev);
+        self.bind_target();
+        let gl = &self.dev.gl;
+        // SAFETY: GL calls on the current context, with this texture's
+        // framebuffer bound; the region is inside it and `buf` holds
+        // `w * h` pixels (sliced here).
+        unsafe {
+            gl.read_pixels(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(bytes_of_mut(&mut buf[..w * h]))),
+            );
+        }
+    }
+
     /// Copy every pixel back into `bytes`, four to a pixel in memory order,
     /// at least `w * h * 4` of them: a frame an app hands over.
     pub(crate) fn read_bytes(&self, bytes: &mut [u8]) {

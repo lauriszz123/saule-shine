@@ -202,6 +202,40 @@ const SCENES: &[(&str, Scene)] = &[
         r.rectangle("fill", 50.0, 50.0, 80.0, 60.0, 0.0, 0.0)?;
         Ok(())
     }),
+    ("rounded shapes cut by the scissor and the screen's edge", |r| {
+        backdrop(r);
+        // A card half out of a scrolled list's view, the same card whole
+        // elsewhere, and ones hanging off each edge of the screen: kept
+        // whole in the shape atlas and cut by the area drawn.
+        r.set_color(0.9, 0.9, 0.95, 0.9);
+        r.set_scissor(Some((10.0, 20.0, 100.0, 30.0)));
+        r.rectangle("fill", 20.0, 5.0, 70.0, 30.0, 9.0, 9.0)?;
+        r.rectangle("fill", 30.0, 40.0, 70.0, 30.0, 9.0, 9.0)?;
+        r.set_scissor(None);
+        r.rectangle("fill", 80.0, 70.0, 70.0, 30.0, 9.0, 9.0)?;
+        r.set_color(0.9, 0.5, 0.2, 0.8);
+        r.rectangle("fill", -20.0, 60.0, 50.0, 40.0, 12.0, 12.0)?;
+        r.rectangle("fill", 130.0, -10.0, 50.0, 40.0, 12.0, 12.0)?;
+        r.rectangle("fill", 60.0, 105.0, 50.0, 40.0, 12.0, 12.0)?;
+        r.circle("fill", 5.0, 5.0, 14.0, None)
+    }),
+    ("a sliver of a large shape, and its outline in pieces", |r| {
+        backdrop(r);
+        // So little of each shows that only the piece is kept; drawn twice,
+        // the second time from the atlas.
+        for _ in 0..2 {
+            r.set_color(0.3, 0.8, 0.9, 0.7);
+            r.set_scissor(Some((100.0, 80.0, 12.0, 10.0)));
+            r.rectangle("fill", 5.0, 5.0, 150.0, 110.0, 30.0, 30.0)?;
+            r.set_scissor(Some((0.0, 0.0, 9.0, 9.0)));
+            r.circle("fill", 60.0, 60.0, 80.0, None)?;
+            r.set_scissor(None);
+            r.set_color(1.0, 1.0, 1.0, 0.6);
+            r.set_line_width(1.0);
+            r.rectangle("line", 3.5, 3.5, 153.0, 113.0, 10.0, 10.0)?;
+        }
+        Ok(())
+    }),
     ("outlines, rounded and square", |r| {
         backdrop(r);
         r.set_color(1.0, 1.0, 1.0, 0.8);

@@ -268,18 +268,36 @@ impl Apps {
     /// copied, the window's image is that buffer (see
     /// `Renderer::show_shared_frame`). An error when the GPU can't take the
     /// buffers, which tells the app to send pixels instead.
+    ///
+    /// The frame is `size`, the corner of the buffer the app drew in (the
+    /// whole buffer, from an app that doesn't say): a window being resized
+    /// draws a new size into the buffers it has, and the window's image
+    /// becomes that size while the buffers stay the ones already taken in.
     #[cfg(target_os = "linux")]
-    fn commit_shared(from: ConnId, id: i64, index: usize) -> Result<(), String> {
-        let (buffers, (w, h), image) = with_server(|s| {
+    fn commit_shared(from: ConnId, id: i64, index: usize, size: Option<(i64, i64)>) -> Result<(), String> {
+        let (buffers, (bw, bh), image) = with_server(|s| {
             let win = Apps::owned(s, from, id)?;
             Ok((win.shared.take(), win.shared_size, win.image.clone()))
         })?;
-        if w <= 0 || h <= 0 {
+        if bw <= 0 || bh <= 0 {
             return Err("a shared frame before any shared buffers".into());
         }
+        let (w, h) = size.unwrap_or((bw, bh));
+        if w <= 0 || h <= 0 || w > bw || h > bh {
+            return Err(format!("a {w}×{h} frame in {bw}×{bh} buffers"));
+        }
+        let before = match &image {
+            Some((img, _, _)) => Some(img.borrow()?.handle),
+            None => None,
+        };
         let handle = Apps::image_for(id, image, w, h)?;
         state::draw(|g| {
             let idx = g.canvas_index(handle, "Compositor")?;
+            // A new image for a new size, the same buffers: they go with it.
+            if let (None, Some(before)) = (&buffers, before.filter(|&b| b != handle)) {
+                let from = g.canvas_index(before, "Compositor")?;
+                g.move_shared_frames(from, idx);
+            }
             let buffers = buffers.as_ref().map(|(b, w, h)| (b, *w as usize, *h as usize));
             g.show_shared_frame(idx, buffers, index)
         })??;
@@ -426,10 +444,12 @@ impl Handler for Apps {
             }
             #[cfg(target_os = "linux")]
             "commitShared" => {
-                let [id, index] = args.as_slice() else {
-                    return Err("commitShared(id, index)".into());
+                let (id, index, size) = match args.as_slice() {
+                    [id, index] => (id, index, None),
+                    [id, index, w, h] => (id, index, Some((int(w)?, int(h)?))),
+                    _ => return Err("commitShared(id, index [, w, h])".into()),
                 };
-                Apps::commit_shared(from, int(id)?, int(index)? as usize)?;
+                Apps::commit_shared(from, int(id)?, int(index)? as usize, size)?;
                 Ok(Vec::new())
             }
             "setTitle" | "setCursor" => {

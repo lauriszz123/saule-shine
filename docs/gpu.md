@@ -46,6 +46,21 @@ Each step keeps the CPU path and is checked against it pixel for pixel.
    relative to its pixel, so the buttons and cards drawn every frame cost
    no coverage pass and no upload after the first. Linear and radial
    gradients (up to eight stops) are evaluated in the shader.
+
+   What keeps the CPU out of a frame, found by measuring on a netbook's
+   speed (a pane of cards being scrolled covered 350,000 pixels a frame on
+   the CPU, and now covers a few hundred):
+
+   - a shape is told apart on a grid of 256ths of a pixel, not by every
+     bit of its outline: the same card a few pixels further down comes out
+     of a layout's arithmetic a hair off, and was a new shape every time;
+   - a shape cut by the scissor is kept too: whole when more than a sliver
+     shows (a card half scrolled out of view is cut at a different row
+     every frame), or just the piece that shows (a window's outline is
+     drawn as four corners cut from the whole);
+   - a large filled rounded rectangle is drawn as three plain rectangles
+     and its four corners (`Renderer::rounded_fill_in_pieces`), as an
+     outline already was, so a card costs its corners and not its area.
 5. **Text** — done. Glyphs are rasterized by the CPU as before (fontdue,
    cached per font) and kept in a glyph atlas, each with an empty border; a
    line at whole pixels (nearly all text) is one draw, and a scaled or
@@ -70,12 +85,20 @@ Each step keeps the CPU path and is checked against it pixel for pixel.
 
    Its frames reach the server without a copy where the driver can share
    GPU buffers (`gpu::dmabuf`): the app shares two textures as dma-bufs
-   (`EGL_MESA_image_dma_buf_export`, sent once per size with
-   `attachShared`), copies each frame into the next of the two on the GPU
+   (`EGL_MESA_image_dma_buf_export`, sent with `attachShared`), copies each frame into the next of the two on the GPU
    and names it (`commitShared`); the server imports them
    (`EGL_EXT_image_dma_buf_import`) and uses them as the window's image as
    they are. Working on Saule Linux in QEMU (virgl, `make GL=1 run-netbook`)
    and the way it will work on the netbook's i915.
+
+   The two textures are made a step (128 pixels) larger than the window
+   each way, and `commitShared` says how much of them the frame fills: a
+   window being resized is a new size every frame, and four buffers made,
+   exported and imported again for each cost a quarter of a second a step
+   at a netbook's speed. They are made anew only when the window outgrows
+   them, or shrinks far below them. The app also doesn't wait for the
+   server's answer to `commitShared` until it is about to write the other
+   buffer, so it works out its next frame meanwhile.
 
    Where the driver can't (WSL's D3D12), or the server refuses, the app
    says so once (with `SHINE_TRACE_PRESENT=1`) and reads each frame from
@@ -117,7 +140,10 @@ at once.
 - `SHINE_GPU_DRAW=0` — present through the GPU, but draw on the CPU.
 - `SHINE_TRACE_PRESENT=1` — which way frames go, and which GPU.
 - `SHINE_TRACE_FRAMES=1` — frame times, copies between CPU and GPU, and
-  shapes per batched draw.
+  shapes per batched draw; and, as it happens, any frame that took over a
+  tenth of a second (with the `Graphics` functions its drawing went to and
+  the shapes covered on the CPU) and any single call over 30 ms. The way to
+  find what makes something stutter the first time it is used.
 - `SHINE_SHARE_FRAMES=0` — an app in a display server sends its frames as
   pixels even where it could share its GPU buffers.
 - Under WSL, Shine asks Mesa for its D3D12 driver (`GALLIUM_DRIVER=d3d12`)

@@ -157,6 +157,10 @@ pub(crate) struct Client {
     /// once, and pixels go through shared memory from then on).
     #[cfg(target_os = "linux")]
     shared: Option<([crate::gpu::Texture; 2], usize)>,
+    /// The last frame named to the server, until it has answered: see
+    /// `present_shared`.
+    #[cfg(target_os = "linux")]
+    committing: Option<saule_ipc::CallId>,
     #[cfg(target_os = "linux")]
     share: bool,
 }
@@ -208,6 +212,8 @@ impl Client {
             #[cfg(target_os = "linux")]
             shared: None,
             #[cfg(target_os = "linux")]
+            committing: None,
+            #[cfg(target_os = "linux")]
             share: std::env::var_os("SHINE_SHARE_FRAMES").is_none_or(|v| v != "0"),
         })
     }
@@ -217,6 +223,20 @@ impl Client {
     /// the size changes), copied there on the GPU, then named to the server
     /// as the frame to show. Two, so the app draws its next frame into one
     /// while the server may still be showing the other.
+    ///
+    /// The server's answer to that naming is not waited for here but at the
+    /// next frame, just before the other buffer is written: that buffer is
+    /// the server's to show until it has taken this one. So the app works
+    /// out its next frame while the server gets round to this one — it
+    /// looks once a frame of its own — instead of standing still for it,
+    /// which on a slow machine was a third of every frame.
+    ///
+    /// The buffers are a little larger than the window (`shared_size`), and
+    /// each frame is named with its own size: the corner of the buffer it
+    /// fills. A window being resized is a new size every frame, and buffers
+    /// made, exported and imported again for each — four of them, on both
+    /// sides — were a quarter of a second a step on a netbook; now that
+    /// happens once in a hundred pixels.
     #[cfg(target_os = "linux")]
     fn present_shared(&mut self, texture: &crate::gpu::Texture) -> Result<(), String> {
         use crate::gpu::{dmabuf, Texture};
@@ -228,14 +248,19 @@ impl Client {
         if dev.egl.as_ref().is_none_or(|egl| !egl.can_export()) {
             return Err("the driver can't share buffers".into());
         }
+        self.committed()?;
+        if !self.input.open {
+            return Ok(());
+        }
         let (w, h) = (texture.w, texture.h);
         let fits = self
             .shared
             .as_ref()
-            .is_some_and(|(buffers, _)| (buffers[0].w, buffers[0].h) == (w, h));
+            .is_some_and(|(buffers, _)| shared_fits((buffers[0].w, buffers[0].h), (w, h)));
         if !fits {
-            let buffers = [Texture::new(&dev, w, h)?, Texture::new(&dev, w, h)?];
-            let mut args = vec![Wire::Int(self.id), Wire::Int(w as i64), Wire::Int(h as i64)];
+            let (bw, bh) = shared_size(w, h);
+            let buffers = [Texture::new(&dev, bw, bh)?, Texture::new(&dev, bw, bh)?];
+            let mut args = vec![Wire::Int(self.id), Wire::Int(bw as i64), Wire::Int(bh as i64)];
             for buffer in &buffers {
                 let shared = dmabuf::export(&dev, buffer).ok_or("the driver won't share a buffer")?;
                 args.extend([
@@ -260,7 +285,36 @@ impl Client {
         // wrote, and nothing else orders the two.
         // SAFETY: a GL call on this app's current context.
         unsafe { glow::HasContext::finish(&dev.gl) };
-        self.call("commitShared", vec![Wire::Int(self.id), Wire::Int(index as i64)])
+        let args = vec![
+            Wire::Int(self.id),
+            Wire::Int(index as i64),
+            Wire::Int(w as i64),
+            Wire::Int(h as i64),
+        ];
+        match self.looper.call_async(self.conn, ROOT, "commitShared", args) {
+            Ok(call) => self.committing = Some(call),
+            Err(CallError::Disconnected) => self.input.open = false,
+            Err(e) => return Err(format!("commitShared: {e}")),
+        }
+        Ok(())
+    }
+
+    /// Wait for the server's answer to the last frame named to it, if it
+    /// hasn't come yet; a server that has gone is the window closing.
+    #[cfg(target_os = "linux")]
+    fn committed(&mut self) -> Result<(), String> {
+        let Some(call) = self.committing.take() else {
+            return Ok(());
+        };
+        let Client { looper, input, .. } = self;
+        match looper.wait(&mut Events { input: &mut *input }, call) {
+            Ok(_) => Ok(()),
+            Err(CallError::Disconnected) => {
+                self.input.open = false;
+                Ok(())
+            }
+            Err(e) => Err(format!("commitShared: {e}")),
+        }
     }
 
     /// A call to the server, waiting for its answer; a server that has gone
@@ -523,4 +577,52 @@ fn headless_gpu() -> Option<std::rc::Rc<crate::gpu::Device>> {
 #[cfg(not(target_os = "linux"))]
 fn headless_gpu() -> Option<std::rc::Rc<crate::gpu::Device>> {
     None
+}
+
+/// How much larger than the window its shared buffers are made, in pixels
+/// a side: a window can grow this far before new ones are needed.
+#[cfg(target_os = "linux")]
+const SHARED_STEP: usize = 128;
+
+/// The size of the buffers shared for a `w` × `h` window: the next whole
+/// step up each way.
+#[cfg(target_os = "linux")]
+fn shared_size(w: usize, h: usize) -> (usize, usize) {
+    let up = |n: usize| n.max(1).div_ceil(SHARED_STEP) * SHARED_STEP;
+    (up(w), up(h))
+}
+
+/// Whether buffers of `have` still serve a `w` × `h` window: large enough,
+/// and not so much larger (a window shrunk a long way) that new, smaller
+/// ones are worth making for the memory.
+#[cfg(target_os = "linux")]
+fn shared_fits(have: (usize, usize), (w, h): (usize, usize)) -> bool {
+    let (need_w, need_h) = shared_size(w, h);
+    let roomy = |have: usize, need: usize| have >= need && have <= need + 2 * SHARED_STEP;
+    roomy(have.0, need_w) && roomy(have.1, need_h)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod shared_tests {
+    use super::*;
+
+    #[test]
+    fn buffers_are_a_step_larger_than_the_window() {
+        assert_eq!(shared_size(1016, 564), (1024, 640));
+        assert_eq!(shared_size(1024, 640), (1024, 640));
+        assert_eq!(shared_size(1, 1), (128, 128));
+    }
+
+    #[test]
+    fn a_window_being_resized_keeps_its_buffers_for_a_while() {
+        let have = shared_size(700, 500);
+        // Growing within the step, and shrinking a fair way: the same.
+        assert!(shared_fits(have, (768, 512)));
+        assert!(shared_fits(have, (700, 500)));
+        assert!(shared_fits(have, (500, 300)));
+        // Grown past them, or shrunk to a fraction: new ones.
+        assert!(!shared_fits(have, (769, 500)));
+        assert!(!shared_fits(have, (700, 513)));
+        assert!(!shared_fits(have, (300, 500)));
+    }
 }

@@ -166,7 +166,8 @@ impl Renderer {
         };
         if let (Some(surface), Some(texture)) = (surface, mirror.active()) {
             crate::trace::copied(false);
-            texture.read(&mut surface.buf);
+            // A window's frame may be the corner of a larger shared buffer.
+            texture.read_corner(&mut surface.buf, surface.w, surface.h);
             if mirror.opaque {
                 for px in &mut surface.buf {
                     *px |= 0xFF00_0000;
@@ -291,6 +292,19 @@ impl Renderer {
         mirror.fresh = Fresh::Gpu;
         mirror.opaque = true;
         Ok(())
+    }
+
+    /// Canvas `to` takes over the shared buffers canvas `from` showed its
+    /// frames from: a window's image is a new canvas when the window
+    /// changes size, and the buffers the app shares, already made into
+    /// textures here, are still the ones it draws in.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn move_shared_frames(&mut self, from: usize, to: usize) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let Some(shared) = gpu.canvases.get_mut(&from).and_then(|m| m.shared.take()) else {
+            return;
+        };
+        gpu.canvases.entry(to).or_default().shared = Some(shared);
     }
 
     /// Whether `which` holds a window's frame with meaningless alpha.
@@ -427,8 +441,8 @@ impl Renderer {
         } else {
             None
         };
-        // A shape drawn before, whole and at a place a whole number of
-        // pixels from where it was: its coverage is in the shape atlas.
+        // A shape drawn before, at a place a whole number of pixels from
+        // where it was: its coverage is in the shape atlas.
         if rect.is_none()
             && let Some(done) = self.gpu_fill_kept(paint, clip, target)
         {
@@ -455,6 +469,7 @@ impl Renderer {
                 &mut mask,
             )
             .map(|(x0, y0, mw, mh)| {
+                crate::trace::covered(mw * mh);
                 (
                     gpu::Clip {
                         x0,
@@ -502,14 +517,38 @@ impl Renderer {
 
     /// Fill the scratch paths from the shape atlas, keeping their coverage
     /// there first if it isn't yet: `None` for a shape that can't be kept
-    /// (cut by the scissor, or too large), which is filled the usual way.
+    /// (cut by a scissor that isn't on whole pixels, or too large for the
+    /// atlas), which is filled the usual way.
     ///
     /// A shape is known by its outline relative to the pixel its box starts
     /// in, so the same button drawn a few pixels further down — or the same
     /// card every frame — is the same shape, and costs no coverage pass on
     /// the CPU and nothing uploaded.
+    ///
+    /// A shape the scissor cuts is kept too, one of two ways:
+    ///
+    /// - **whole**, worked out in a box of its own, when more than a sliver
+    ///   of it shows: the cut is then the GPU's, by the area it draws. A list
+    ///   being scrolled always has a card half out of view, cut at a
+    ///   different row every frame, and covering that card afresh each
+    ///   time — hundreds of thousands of pixels on the CPU, then uploaded —
+    ///   was most of what scrolling cost;
+    /// - **the piece that shows**, when that is a small part of it: a
+    ///   window's outline is drawn as its four corners, each the whole
+    ///   outline cut to a small box, and keeping the whole for those would
+    ///   cover a window's worth of pixels to draw a few.
     fn gpu_fill_kept(&mut self, paint: &Paint, clip: Rect, target: Which) -> Option<bool> {
         use std::hash::{Hash, Hasher};
+
+        // The outline on a grid of 256ths of a pixel, which is finer than
+        // coverage can tell apart. The same card a few pixels further down
+        // comes out of the layout's arithmetic a hair off (68.3 − 100 and
+        // 68.3 − 101 differ in their last bit), and told apart by every bit
+        // it would be a new shape at every step of a scroll.
+        const GRID: f64 = 256.0;
+        let on_grid = |v: f64| (v * GRID).round() / GRID;
+        /// The longest side kept: the atlas's own limit, less its borders.
+        const LONGEST: usize = 4000;
 
         let paths = self.scratch.paths.paths();
         let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
@@ -518,50 +557,128 @@ impl Renderer {
             if !x.is_finite() || !y.is_finite() {
                 return None;
             }
+            let (x, y) = (on_grid(x), on_grid(y));
             (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
         }
-        let whole = x0 >= clip.x0 && y0 >= clip.y0 && x1 <= clip.x1 && y1 <= clip.y1;
-        if !whole || x0 > x1 {
+        if x0 > x1 {
             return None;
         }
-        let (ox, oy) = (x0.floor(), y0.floor());
+        let (w, h) = self.target_size();
+
+        // The shape's box in whole pixels, wherever it is: it may start
+        // left of the surface or end below it.
+        let (bx0, by0) = (x0.floor(), y0.floor());
+        let (bw, bh) = (x1.ceil() - bx0, y1.ceil() - by0);
+        if bw < 1.0 || bh < 1.0 || bw > 1e6 || bh > 1e6 {
+            return None;
+        }
+        let (bw, bh) = (bw as usize, bh as usize);
+
+        // The pixels of it to draw: its box, within the scissor.
+        let whole = x0 >= clip.x0 && y0 >= clip.y0 && x1 <= clip.x1 && y1 <= clip.y1;
+        let on_pixels = |v: f64| v.fract() == 0.0;
+        if !whole && !(on_pixels(clip.x0) && on_pixels(clip.y0) && on_pixels(clip.x1) && on_pixels(clip.y1)) {
+            return None;
+        }
+        let seen = Rect {
+            x0: bx0,
+            y0: by0,
+            x1: bx0 + bw as f64,
+            y1: by0 + bh as f64,
+        }
+        .intersect(&clip);
+        let (ax0, ay0, ax1, ay1) = seen.pixel_bounds(w, h);
+        if ax0 >= ax1 || ay0 >= ay1 {
+            return Some(true);
+        }
+
+        // In its own box: each point from the box's corner, in grid steps.
+        let local = |(x, y): crate::geom::Point| (on_grid(x) - bx0, on_grid(y) - by0);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         paths.len().hash(&mut hasher);
         for path in paths {
             path.len().hash(&mut hasher);
-            for &(x, y) in path {
-                (x - ox).to_bits().hash(&mut hasher);
-                (y - oy).to_bits().hash(&mut hasher);
+            for &point in path {
+                let (x, y) = local(point);
+                ((x * GRID) as i64).hash(&mut hasher);
+                ((y * GRID) as i64).hash(&mut hasher);
             }
         }
-        let key = (hasher.finish(), '\u{1}');
+        let outline = hasher.finish();
+        let whole_key = (outline, '\u{1}');
 
-        let (w, h) = self.target_size();
+        // The piece that shows, from the box's corner; and whether the
+        // whole is worth keeping instead: all of it shows, or enough that
+        // it is on its way into view (a card scrolling in, of which more
+        // shows every frame) rather than a corner cut from something big.
+        let piece = (
+            (ax0 as f64 - bx0) as usize,
+            (ay0 as f64 - by0) as usize,
+            (ax1 as f64 - bx0) as usize,
+            (ay1 as f64 - by0) as usize,
+        );
+        let fits = bw <= LONGEST && bh <= LONGEST;
+        let shows = (piece.2 - piece.0) * (piece.3 - piece.1);
+        let keep_whole = fits && (whole || shows * 16 >= bw * bh);
+
         let dev = Rc::clone(&self.gpu.as_ref()?.dev);
-        let corner = match gpu::kept_shape(&dev, key) {
-            Some(corner) => corner,
-            None => {
-                let mut mask = std::mem::take(&mut self.scratch.mask);
-                let found = raster::coverage_mask(
-                    self.scratch.paths.paths(),
-                    clip,
-                    (w, h),
-                    &mut self.scratch.fill,
-                    &mut mask,
-                );
-                let kept = found.and_then(|(_, _, mw, mh)| gpu::keep_shape(&dev, key, &mask, mw, mh));
-                self.scratch.mask = mask;
-                match (found, kept) {
-                    (None, _) => return Some(true),
-                    (Some(_), None) => return None,
-                    (Some(_), Some(corner)) => corner,
+        // Where in the atlas, and the target pixel its first texel is for.
+        let (corner, origin) = if let Some(corner) = gpu::kept_shape(&dev, whole_key) {
+            (corner, (bx0 as i64, by0 as i64))
+        } else {
+            let (key, cut) = if keep_whole {
+                (whole_key, (0, 0, bw, bh))
+            } else {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (outline, piece).hash(&mut hasher);
+                ((hasher.finish(), '\u{2}'), piece)
+            };
+            let origin = (bx0 as i64 + cut.0 as i64, by0 as i64 + cut.1 as i64);
+            match gpu::kept_shape(&dev, key) {
+                Some(corner) => (corner, origin),
+                None => {
+                    // On a surface just the box's size, the outline as it
+                    // was told apart: so the coverage kept is the one for
+                    // this key, whichever shape sharing it came first.
+                    let local: Vec<Vec<crate::geom::Point>> = paths
+                        .iter()
+                        .map(|path| path.iter().map(|&point| local(point)).collect())
+                        .collect();
+                    let within = Rect {
+                        x0: cut.0 as f64,
+                        y0: cut.1 as f64,
+                        x1: cut.2 as f64,
+                        y1: cut.3 as f64,
+                    };
+                    let mut mask = std::mem::take(&mut self.scratch.mask);
+                    let found = raster::coverage_mask(
+                        &local,
+                        within,
+                        (bw, bh),
+                        &mut self.scratch.fill,
+                        &mut mask,
+                    );
+                    // Exactly the cut, or it isn't kept: where it is drawn
+                    // from is reckoned from the cut's corner.
+                    let (cw, ch) = (cut.2 - cut.0, cut.3 - cut.1);
+                    let kept = match found {
+                        Some(found) if found == (cut.0, cut.1, cw, ch) => {
+                            crate::trace::covered(cw * ch);
+                            gpu::keep_shape(&dev, key, &mask, cw, ch)
+                        }
+                        _ => None,
+                    };
+                    self.scratch.mask = mask;
+                    match (found, kept) {
+                        (None, _) => return Some(true),
+                        (Some(_), None) => return None,
+                        (Some(_), Some(corner)) => (corner, origin),
+                    }
                 }
             }
         };
-        // The box is the shape's pixels, as `coverage_mask` found them.
-        let (ax0, ay0, ax1, ay1) = Rect { x0, y0, x1, y1 }.pixel_bounds(w, h);
-        if ax0 >= ax1 || ay0 >= ay1 || self.sync_gpu(target, false).is_err() {
-            return Some(ax0 >= ax1 || ay0 >= ay1);
+        if self.sync_gpu(target, false).is_err() {
+            return Some(false);
         }
         let texture = self.texture(target)?;
         gpu::fill(
@@ -578,10 +695,7 @@ impl Renderer {
                     y1: ay1,
                 },
             },
-            gpu::Cover::Kept {
-                origin: (ax0, ay0),
-                corner,
-            },
+            gpu::Cover::Kept { origin, corner },
         );
         self.touched_gpu(target);
         Some(true)

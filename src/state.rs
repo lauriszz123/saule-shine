@@ -254,6 +254,8 @@ pub fn with<R>(f: impl FnOnce(&mut Engine) -> R) -> Result<R, String> {
 
 /// Run `f` against the renderer. The common case: most `Graphics.*` calls
 /// never touch the window at all.
+#[track_caller]
 pub fn draw<R>(f: impl FnOnce(&mut Renderer) -> R) -> Result<R, String> {
-    crate::trace::drawing(|| with(|engine| f(&mut engine.r)))
+    let caller = std::panic::Location::caller();
+    crate::trace::drawing(caller, || with(|engine| f(&mut engine.r)))
 }
