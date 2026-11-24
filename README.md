@@ -97,6 +97,7 @@ a1, a2 [, arctype])`, `polygon(mode, points)`, `line(x1, y1, x2, y2)`,
 `newImageFromBase64(data)`, `setCanvas([handle])`, `getCanvas()`,
 `imageSize(handle)`, `draw(handle, x, y [, angle, sx, sy, ox, oy])`,
 `drawFrame(handle, fx, fy, fw, fh, x, y [, angle, sx, sy, ox, oy])`,
+`drawRounded(image, x, y, radius)` (corners rounded off, antialiased),
 `saveImage(handle, path)`
 
 **Resources** — `release(handle)`, `releaseFont(handle)`, `getStats()`

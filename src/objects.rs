@@ -517,6 +517,23 @@ fn graphics_draw(
     state::draw(|gfx| gfx.draw_canvas(handle, at.x, at.y, at.r, at.sx, at.sy, at.ox, at.oy))?
 }
 
+/// `Graphics.drawRounded(texture, x, y, radius)` — draw an `Image` or
+/// `Canvas` at `x, y` with its corners rounded off to `radius` pixels. What
+/// is behind shows through outside the curves, and the edge is smooth.
+///
+/// ```text
+/// Graphics.drawRounded(window, 20.0, 40.0, 8.0)
+/// ```
+///
+/// A window manager draws app windows this way: the corners come off the
+/// image itself, so whatever is behind — a wallpaper, another window — is
+/// left as it was.
+#[saule_export(class = "Graphics", name = "drawRounded", sig(texture = "Drawable"))]
+fn graphics_draw_rounded(texture: SValue, x: f64, y: f64, radius: f64) -> Result<(), String> {
+    let handle = texture_handle(&texture, "Graphics.drawRounded")?;
+    state::draw(|gfx| gfx.draw_rounded(handle, x, y, radius))?
+}
+
 /// `Graphics.drawq(texture, quad [, x, y, r, sx, sy, ox, oy])` — draw the
 /// part of an `Image` or `Canvas` that `quad` selects. Love2D 11 spells this
 /// `draw(texture, quad, …)`; Saule has no overloading, so it keeps Love2D

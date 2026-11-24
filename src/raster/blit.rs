@@ -123,14 +123,50 @@ pub fn blit_surface_sub(
         // as-is — and it skips the channel-wise modulate entirely, so the
         // branch is hoisted out of the row rather than tested per pixel.
         let plain = tint.is_opaque_white();
+        let radius = paint.corner_radius.min(sub_w / 2.0).min(sub_h / 2.0);
 
         for py in y0..y1 {
             let src_base =
                 (py as i64 - oy + sy0) as usize * src.w + (x0 as i64 - ox + sx0) as usize;
             let dst_base = py * dst.w + x0;
 
-            if plain {
+            // A row that crosses a rounded corner: its few pixels near each
+            // end are drawn at the share of them inside the curve. Every
+            // other row takes the loops below untouched.
+            let v = (py as i64 - oy) as f64 + 0.5;
+            if radius > 0.0 && (v < radius || v > sub_h - radius) {
                 for k in 0..x1 - x0 {
+                    let u = (x0 as i64 - ox) as f64 + k as f64 + 0.5;
+                    let cover = (corner_coverage(u, v, sub_w, sub_h, radius) * 255.0) as u32;
+                    let s = src.buf[src_base + k];
+                    if cover == 0 || s >> 24 == 0 {
+                        continue;
+                    }
+                    // Between the two corners: an opaque pixel is a copy.
+                    if cover == 255 && plain && s >> 24 == 255 {
+                        dst.buf[dst_base + k] = s;
+                        continue;
+                    }
+                    dst.blend_alpha8(dst_base + k, Src8::from_pixel(s).modulate(tint), cover);
+                }
+                continue;
+            }
+
+            if plain {
+                // A row with no see-through pixels — most of them, for a
+                // window or a wallpaper — is a straight copy. Checking first
+                // costs less than blending pixel by pixel, because both the
+                // check and the copy run many pixels at a time.
+                let n = x1 - x0;
+                let row = &src.buf[src_base..src_base + n];
+                // AND-ing the row together leaves the alpha byte at 255 only
+                // if every pixel's is; with no early exit the compiler can
+                // do it many pixels to an instruction.
+                if row.iter().fold(u32::MAX, |all, &s| all & s) >= 0xFF00_0000 {
+                    dst.buf[dst_base..dst_base + n].copy_from_slice(row);
+                    continue;
+                }
+                for k in 0..n {
                     let s = src.buf[src_base + k];
                     let sa = s >> 24;
                     if sa == 0 {
@@ -158,6 +194,7 @@ pub fn blit_surface_sub(
     let Some(inv) = xform.inverse() else { return };
     let bounds = transformed_bounds(xform, sub_w, sub_h);
     let (x0, y0, x1, y1) = bounds.intersect(&clip).pixel_bounds(dst.w, dst.h);
+    let radius = paint.corner_radius.min(sub_w / 2.0).min(sub_h / 2.0);
 
     for py in y0..y1 {
         let dst_row = py * dst.w;
@@ -166,6 +203,14 @@ pub fn blit_surface_sub(
             // Reject outside the source rect rather than clamping, so a
             // rotated canvas has clean edges instead of smeared borders.
             if u < 0.0 || v < 0.0 || u >= sub_w || v >= sub_h {
+                continue;
+            }
+            let cover = if radius > 0.0 {
+                corner_coverage(u, v, sub_w, sub_h, radius)
+            } else {
+                1.0
+            };
+            if cover <= 0.0 {
                 continue;
             }
             // Keep bilinear taps half a pixel inside the region: on a
@@ -188,9 +233,34 @@ pub fn blit_surface_sub(
                 sb * paint.color[2],
                 sa * paint.color[3],
             ];
-            dst.blend(dst_row + px, tint, 1.0, paint.blend);
+            dst.blend(dst_row + px, tint, cover, paint.blend);
         }
     }
+}
+
+/// How much of the pixel centred at `(u, v)` lies inside a `w × h` rectangle
+/// whose corners are rounded off to `radius`: 1 away from the corners, 0
+/// outside a curve, and the share in between along one, which is what makes
+/// the edge smooth rather than stepped.
+#[inline]
+pub(crate) fn corner_coverage(u: f64, v: f64, w: f64, h: f64, radius: f64) -> f32 {
+    // The centre of the corner's circle, when the point is in a corner square.
+    let cx = if u < radius {
+        radius
+    } else if u > w - radius {
+        w - radius
+    } else {
+        return 1.0;
+    };
+    let cy = if v < radius {
+        radius
+    } else if v > h - radius {
+        h - radius
+    } else {
+        return 1.0;
+    };
+    let distance = ((u - cx) * (u - cx) + (v - cy) * (v - cy)).sqrt();
+    (radius - distance + 0.5).clamp(0.0, 1.0) as f32
 }
 
 /// Whether a source region lands on whole pixels, so it can be indexed

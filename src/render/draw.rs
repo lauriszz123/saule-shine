@@ -396,6 +396,25 @@ impl Renderer {
         rx: f64,
         ry: f64,
     ) -> Result<(), String> {
+        if mode == "line" && self.outline_in_pieces(x, y, w, h, rx, ry)? {
+            return Ok(());
+        }
+        self.rectangle_path(mode, x, y, w, h, rx, ry)
+    }
+
+    /// `rectangle` the general way: the whole outline as one path through
+    /// the filler.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rectangle_path(
+        &mut self,
+        mode: &str,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        rx: f64,
+        ry: f64,
+    ) -> Result<(), String> {
         if rx > 0.0 || ry > 0.0 {
             let segs = self.segments_for(rx.abs().max(ry.abs()));
             geom::rounded_rect_path_into(x, y, w, h, rx, ry, segs, &mut self.scratch.local);
@@ -403,6 +422,98 @@ impl Renderer {
             geom::rect_path_into(x, y, w, h, &mut self.scratch.local);
         }
         self.draw_local_path(mode, true)
+    }
+
+    /// `rectangle("line", …)` drawn in pieces: each straight side filled as
+    /// a thin rectangle, and the stroked path itself only near the corners.
+    ///
+    /// The filler walks every row of a shape's bounding box from its left
+    /// edge to its right, the empty inside of an outline included, so a
+    /// window-sized outline cost about what filling the window did. A thin
+    /// rectangle takes the filler's fast path instead, and the corners are
+    /// small.
+    ///
+    /// The pixels are the path's own. Each corner is the real stroke,
+    /// clipped to a box around the corner that ends on a pixel boundary,
+    /// and the sides run from one box to the next, where the stroke is
+    /// straight. So no pixel is drawn by two pieces, which would show as a
+    /// faint notch on a see-through or half-pixel line.
+    ///
+    /// Only while the transform moves and scales (no turning or flipping);
+    /// returns whether it drew, and if not, the caller draws the path.
+    fn outline_in_pieces(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        rx: f64,
+        ry: f64,
+    ) -> Result<bool, String> {
+        let t = self.st.transform;
+        if t.b != 0.0 || t.c != 0.0 || t.a <= 0.0 || t.d <= 0.0 || self.st.line_width <= 0.0 {
+            return Ok(false);
+        }
+
+        let (x, w) = if w < 0.0 { (x + w, -w) } else { (x, w) };
+        let (y, h) = if h < 0.0 { (y + h, -h) } else { (y, h) };
+        // The same clamping `rounded_rect_path_into` does: a radius only
+        // counts when both are set.
+        let (rx, ry) = match (rx.abs().min(w * 0.5), ry.abs().min(h * 0.5)) {
+            (rx, ry) if rx > 0.0 && ry > 0.0 => (rx, ry),
+            _ => (0.0, 0.0),
+        };
+
+        // In device pixels from here: the stroke is as wide on screen
+        // whatever the scale, so its sides are worked out on screen too.
+        let half = self.st.line_width * t.mean_scale() / 2.0;
+        let (left, top) = t.apply(x, y);
+        let (right, bottom) = t.apply(x + w, y + h);
+        let (curve_x, curve_y) = (rx * t.a, ry * t.d);
+
+        // Where the straight parts start and end: past the curves and past
+        // the sides crossing them (or the top and the left side would both
+        // draw the corner of a square one), moved out to whole pixels.
+        let (inset_x, inset_y) = (curve_x.max(half), curve_y.max(half));
+        let x0 = (left + inset_x).ceil();
+        let x1 = (right - inset_x).floor();
+        let y0 = (top + inset_y).ceil();
+        let y1 = (bottom - inset_y).floor();
+        if x0 >= x1 || y0 >= y1 {
+            return Ok(false);
+        }
+
+        self.fill_device(x0, top - half, x1, top + half)?;
+        self.fill_device(x0, bottom - half, x1, bottom + half)?;
+        self.fill_device(left - half, y0, left + half, y1)?;
+        self.fill_device(right - half, y0, right + half, y1)?;
+
+        let far = f64::INFINITY;
+        let corners = [
+            Rect { x0: -far, y0: -far, x1: x0, y1: y0 },
+            Rect { x0: x1, y0: -far, x1: far, y1: y0 },
+            Rect { x0: x1, y0: y1, x1: far, y1: far },
+            Rect { x0: -far, y0: y1, x1: x0, y1: far },
+        ];
+        let scissor = self.st.scissor;
+        let (tw, th) = self.target_size();
+        let within = scissor.unwrap_or(Rect::surface(tw, th));
+        for corner in corners {
+            self.st.scissor = Some(within.intersect(&corner));
+            let drawn = self.rectangle_path("line", x, y, w, h, rx, ry);
+            self.st.scissor = scissor;
+            drawn?;
+        }
+        Ok(true)
+    }
+
+    /// Fill the device-space box from `(x0, y0)` to `(x1, y1)`.
+    fn fill_device(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) -> Result<(), String> {
+        let t = self.st.transform;
+        let (lx, ly) = ((x0 - t.tx) / t.a, (y0 - t.ty) / t.d);
+        let (lw, lh) = ((x1 - x0) / t.a, (y1 - y0) / t.d);
+        geom::rect_path_into(lx, ly, lw, lh, &mut self.scratch.local);
+        self.draw_local_path("fill", true)
     }
 
     pub fn circle(

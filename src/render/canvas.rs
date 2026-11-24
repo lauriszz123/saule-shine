@@ -68,6 +68,7 @@ impl Renderer {
             antialias: self.st.smooth,
             linear_filter: self.linear_filter,
             gradient: self.st.gradient,
+            corner_radius: 0.0,
         }
     }
 
@@ -160,6 +161,25 @@ impl Renderer {
         )
     }
 
+    /// Composite a canvas onto the current target at `(x, y)`, its corners
+    /// rounded off to `radius`: `Graphics.drawRounded`.
+    pub(crate) fn draw_rounded(
+        &mut self,
+        handle: i64,
+        x: f64,
+        y: f64,
+        radius: f64,
+    ) -> Result<(), String> {
+        let idx = self.canvas_index(handle, "Graphics.drawRounded")?;
+        let (w, h) = self.canvas_size(idx, "Graphics.drawRounded")?;
+        let frame = Rect::new(0.0, 0.0, w as f64, h as f64);
+        let paint = Paint {
+            corner_radius: radius.max(0.0),
+            ..self.blit_paint()
+        };
+        self.blit_with(idx, frame, x, y, 0.0, 1.0, 1.0, 0.0, 0.0, paint)
+    }
+
     /// Composite one cell of an image onto the current target — the
     /// spritesheet draw. `frame` selects the source rectangle; the rest
     /// positions it exactly like [`Renderer::draw_canvas`].
@@ -194,6 +214,25 @@ impl Renderer {
         ox: f64,
         oy: f64,
     ) -> Result<(), String> {
+        let paint = self.blit_paint();
+        self.blit_with(idx, frame, x, y, angle, sx, sy, ox, oy, paint)
+    }
+
+    /// [`Renderer::blit`] with the paint given.
+    #[allow(clippy::too_many_arguments)]
+    fn blit_with(
+        &mut self,
+        idx: usize,
+        frame: Rect,
+        x: f64,
+        y: f64,
+        angle: f64,
+        sx: f64,
+        sy: f64,
+        ox: f64,
+        oy: f64,
+        paint: Paint,
+    ) -> Result<(), String> {
         if self.target == Some(idx) {
             return Err("Graphics.draw: an image cannot be drawn onto itself".into());
         }
@@ -203,7 +242,6 @@ impl Renderer {
             .then(&Transform::scaling(sx, sy))
             .then(&Transform::translation(-ox, -oy));
         let xform = self.st.transform.then(&local);
-        let paint = self.blit_paint();
 
         // Lift the source out of the registry so the source and destination
         // borrows are provably disjoint, then put it straight back.

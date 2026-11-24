@@ -814,3 +814,67 @@ fn copies_crops_and_replacing_round_trip() {
 
     assert!(r.replace_pixels(img, cell).is_err(), "sizes must match");
 }
+
+/// The largest difference in any channel between two screens, and how many
+/// pixels differ by more than `tolerance`.
+fn screen_delta(a: &Renderer, b: &Renderer, tolerance: u32) -> (u32, usize) {
+    let mut worst = 0;
+    let mut off = 0;
+    for (p, q) in a.screen.buf.iter().zip(&b.screen.buf) {
+        let delta = (0..4)
+            .map(|k| ((p >> (8 * k)) & 0xFF).abs_diff((q >> (8 * k)) & 0xFF))
+            .max()
+            .unwrap_or(0);
+        worst = worst.max(delta);
+        if delta > tolerance {
+            off += 1;
+        }
+    }
+    (worst, off)
+}
+
+#[test]
+fn an_outline_drawn_in_pieces_matches_the_path() {
+    // Square and rounded, thin and thick, on and off whole pixels, moved and
+    // scaled: the pieces draw what the one path did.
+    let cases = [
+        (10.0, 10.0, 60.0, 40.0, 0.0, 1.0, 1.0),
+        (10.5, 10.5, 59.0, 39.0, 0.0, 1.0, 1.0),
+        (10.0, 10.0, 60.0, 40.0, 8.0, 1.0, 1.0),
+        (10.5, 10.5, 59.0, 39.0, 8.0, 1.0, 1.0),
+        (12.0, 8.0, 50.0, 44.0, 6.0, 3.0, 1.0),
+        (6.0, 6.0, 30.0, 20.0, 5.0, 1.0, 2.0),
+        (6.25, 6.75, 30.0, 20.0, 5.0, 1.5, 1.5),
+    ];
+    for (x, y, w, h, radius, width, scale) in cases {
+        let draw = |pieces: bool| {
+            let mut r = renderer(160, 120);
+            r.scale(scale, scale);
+            r.set_color(0.2, 0.6, 1.0, 0.7);
+            r.set_line_width(width);
+            if pieces {
+                r.rectangle("line", x, y, w, h, radius, radius).expect("pieces");
+            } else {
+                r.rectangle_path("line", x, y, w, h, radius, radius).expect("path");
+            }
+            r
+        };
+        let (pieces, path) = (draw(true), draw(false));
+        assert!(pieces.written() > 0, "nothing drawn for {x} {y} {w} {h} r{radius}");
+
+        // The same pixels, give or take rounding.
+        let (worst, off) = screen_delta(&pieces, &path, 2);
+        assert!(
+            off == 0,
+            "{x} {y} {w} {h} r{radius} w{width} s{scale}: {off} pixels off, worst by {worst}"
+        );
+    }
+}
+
+#[test]
+fn a_turned_outline_is_still_drawn() {
+    let mut r = renderer(80, 80);
+    r.rotate(0.3);
+    r.rectangle("line", 20.0, 10.0, 40.0, 30.0, 6.0, 6.0).expect("rotated");
+    assert!(r.written() > 0);
+}

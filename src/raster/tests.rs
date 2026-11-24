@@ -9,6 +9,7 @@ fn paint(color: [f32; 4], w: usize, h: usize) -> Paint {
         antialias: true,
         linear_filter: false,
         gradient: None,
+        corner_radius: 0.0,
     }
 }
 
@@ -496,4 +497,53 @@ fn blend_mode_names_round_trip() {
         assert_eq!(BlendMode::parse(name).unwrap().name(), name);
     }
     assert!(BlendMode::parse("glow").is_err());
+}
+
+/// An opaque white image drawn with rounded corners onto black.
+fn rounded(xform: &Transform) -> Surface {
+    let mut image = Surface::new(20, 20);
+    image.buf.fill(0xFFFF_FFFF);
+    let mut dst = Surface::opaque(24, 24);
+    let p = Paint {
+        corner_radius: 6.0,
+        ..paint([1.0, 1.0, 1.0, 1.0], 24, 24)
+    };
+    blit_surface(&mut dst, &image, xform, &p);
+    dst
+}
+
+#[test]
+fn a_rounded_blit_leaves_the_corners_alone() {
+    let dst = rounded(&Transform::translation(2.0, 2.0));
+    let at = |x: usize, y: usize| dst.buf[y * 24 + x];
+
+    // The very corners stay as they were: black.
+    for (x, y) in [(2, 2), (21, 2), (2, 21), (21, 21)] {
+        assert_eq!(at(x, y), 0xFF00_0000, "corner ({x}, {y}) was drawn on");
+    }
+    // The middle and the middle of each edge are drawn in full.
+    for (x, y) in [(12, 12), (12, 2), (2, 12), (21, 12), (12, 21)] {
+        assert_eq!(at(x, y), 0xFFFF_FFFF, "({x}, {y}) should be white");
+    }
+    // Along the curve, a pixel is partly covered: some grey.
+    let edge = (0..24).map(|x| at(x, 3) & 0xFF).find(|c| *c > 0 && *c < 255);
+    assert!(edge.is_some(), "the curve should be antialiased");
+}
+
+#[test]
+fn a_rounded_blit_is_the_same_on_either_path() {
+    let direct = rounded(&Transform::translation(2.0, 2.0));
+    let nudged = Transform::translation(2.0 + 1e-5, 2.0 + 1e-5);
+    let sampled = rounded(&nudged);
+
+    let (delta, at) = max_channel_delta(&direct, &sampled);
+    assert!(delta <= 1, "off by {delta} at pixel {at}");
+}
+
+#[test]
+fn corner_coverage_is_whole_away_from_the_corners() {
+    assert_eq!(corner_coverage(10.0, 10.0, 20.0, 20.0, 6.0), 1.0);
+    assert_eq!(corner_coverage(0.5, 10.0, 20.0, 20.0, 6.0), 1.0);
+    assert_eq!(corner_coverage(0.5, 0.5, 20.0, 20.0, 6.0), 0.0);
+    assert_eq!(corner_coverage(19.5, 19.5, 20.0, 20.0, 6.0), 0.0);
 }

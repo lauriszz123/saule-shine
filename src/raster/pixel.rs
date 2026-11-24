@@ -408,6 +408,10 @@ pub struct Paint {
     /// Colour source for fills. `None` is the flat [`Paint::color`]; a
     /// gradient replaces it per pixel and gives up the solid-run fast paths.
     pub gradient: Option<Gradient>,
+    /// Blits only: round the corners of what is drawn off to this radius, in
+    /// the source's pixels. 0 draws it square. See
+    /// [`corner_coverage`](super::blit::corner_coverage).
+    pub corner_radius: f64,
 }
 
 impl Paint {
