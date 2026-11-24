@@ -16,10 +16,15 @@
 //! outside a colour-emoji font has emoji, so a missing glyph used to rasterize
 //! as a blank box with no recourse. Each [`FontRes`] therefore keeps a lazily
 //! loaded chain of host faces ([`fallback_candidates`]) and consults it for any
-//! codepoint its primary face lacks. The chain is loaded once, on the first
-//! character that actually needs it, so a Latin-only UI never pays for it.
+//! codepoint its primary face lacks. The chain is shared by every font object
+//! and loaded a face at a time, only as far as a missing character needs: a
+//! Latin-only UI never pays for it, and one symbol the UI font lacks costs
+//! the first face that has it, not every face the host has. Parsing a face
+//! reads all its outlines, which for a CJK or emoji collection is a long
+//! pause (a third of a second on a fast desktop, seconds on macOS's chain).
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use fontdue::{Font, FontSettings};
 
@@ -41,10 +46,6 @@ pub struct Glyph {
 /// `Font` object.
 pub struct FontRes {
     face: Font,
-    /// Host faces consulted for codepoints `face` does not cover. Empty until
-    /// the first missing glyph forces [`FontRes::load_fallbacks`].
-    fallbacks: Vec<Font>,
-    fallbacks_loaded: bool,
     size: f32,
     ascent: f64,
     line_height: f64,
@@ -68,8 +69,6 @@ impl FontRes {
 
         Ok(FontRes {
             face,
-            fallbacks: Vec::new(),
-            fallbacks_loaded: false,
             size,
             ascent,
             line_height,
@@ -94,21 +93,6 @@ impl FontRes {
         self.line_height
     }
 
-    /// Load the host's wide-coverage faces, once, on first need.
-    fn load_fallbacks(&mut self) {
-        if self.fallbacks_loaded {
-            return;
-        }
-        self.fallbacks_loaded = true;
-        for path in fallback_candidates() {
-            if let Ok(bytes) = std::fs::read(path)
-                && let Ok(face) = parse_face(&bytes, self.size)
-            {
-                self.fallbacks.push(face);
-            }
-        }
-    }
-
     /// Rasterize `ch` if it isn't cached yet, falling back to another face when
     /// the primary one has no glyph for it.
     fn ensure(&mut self, ch: char) {
@@ -116,19 +100,15 @@ impl FontRes {
             return;
         }
 
-        if !self.face.has_glyph(ch) {
-            self.load_fallbacks();
-        }
         // The primary face wins whenever it can draw the character at all;
         // only a genuine miss consults the chain, and a miss everywhere falls
         // back to the primary's `.notdef` so something visible is drawn.
+        let fallback;
         let source = if self.face.has_glyph(ch) {
             &self.face
         } else {
-            self.fallbacks
-                .iter()
-                .find(|f| f.has_glyph(ch))
-                .unwrap_or(&self.face)
+            fallback = fallback_for(ch);
+            fallback.as_deref().unwrap_or(&self.face)
         };
 
         let (metrics, data) = source.rasterize(ch, self.size);
@@ -309,6 +289,42 @@ fn parse_face(bytes: &[u8], size: f32) -> Result<Font, String> {
     Font::from_bytes(bytes, settings).map_err(|e| format!("could not parse font: {e}"))
 }
 
+/// The host's fallback faces, in [`fallback_candidates`] order, as far as they
+/// have been needed: `None` for a file that is missing or doesn't parse.
+static FALLBACKS: Mutex<Vec<Option<Arc<Font>>>> = Mutex::new(Vec::new());
+
+/// The first fallback face that has `ch`, parsing further faces only when
+/// the ones already parsed lack it.
+///
+/// Faces are kept at the default optimisation size: one parse serves every
+/// size, since rasterizing takes the size it draws at.
+fn fallback_for(ch: char) -> Option<Arc<Font>> {
+    fallback_from(fallback_candidates(), &FALLBACKS, ch)
+}
+
+fn fallback_from(
+    candidates: &[&str],
+    chain: &Mutex<Vec<Option<Arc<Font>>>>,
+    ch: char,
+) -> Option<Arc<Font>> {
+    let mut chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(face) = chain.iter().flatten().find(|f| f.has_glyph(ch)) {
+        return Some(face.clone());
+    }
+    while chain.len() < candidates.len() {
+        let face = std::fs::read(candidates[chain.len()])
+            .ok()
+            .and_then(|bytes| parse_face(&bytes, DEFAULT_SIZE as f32).ok())
+            .map(Arc::new);
+        let found = face.as_ref().is_some_and(|f| f.has_glyph(ch));
+        chain.push(face.clone());
+        if found {
+            return face;
+        }
+    }
+    None
+}
+
 /// Drop a line's trailing spaces, which are layout artefacts rather than text.
 fn trim_trailing(line: &mut WrapLine) {
     let trimmed = line.text.trim_end().len();
@@ -393,7 +409,6 @@ fn break_units(text: &str, out: &mut Vec<(usize, usize)>) {
         let after_space = previous == ' ';
         let wide_boundary =
             (is_wide(ch) || is_wide(previous)) && !no_break_before(ch) && !no_break_after(previous);
-
         if after_space || wide_boundary {
             out.push((start, i));
             start = i;
@@ -509,9 +524,12 @@ fn default_font_candidates() -> &'static [&'static str] {
 
 /// Wide-coverage faces consulted for codepoints the primary face lacks.
 ///
-/// Ordered so the most complete face wins: a pan-Unicode face first, then the
-/// per-script ones, then emoji. Missing files are skipped, so listing a face
-/// the host does not have costs one failed `read`.
+/// Ordered so the most complete face wins, as far as the cost of parsing
+/// allows: symbol faces first (small, and they have the UI's symbols: arrows,
+/// keys, shapes), then a pan-Unicode face, then the per-script ones, which
+/// are large, then emoji. The chain is parsed only as far as a character
+/// needs, so a symbol never costs a CJK collection. Missing files are
+/// skipped, so listing a face the host does not have costs one failed `read`.
 fn fallback_candidates() -> &'static [&'static str] {
     #[cfg(target_os = "windows")]
     {
@@ -526,24 +544,26 @@ fn fallback_candidates() -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
     {
         &[
+            "/System/Library/Fonts/Apple Symbols.ttf",
             "/Library/Fonts/Arial Unicode.ttf",
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
             "/System/Library/Fonts/PingFang.ttc",
             "/System/Library/Fonts/Hiragino Sans GB.ttc",
             "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-            "/System/Library/Fonts/Apple Symbols.ttf",
             "/System/Library/Fonts/Apple Color Emoji.ttc",
         ]
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         &[
+            "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            // WSL: the Windows symbol face, when its font folder is mounted.
+            "/mnt/c/Windows/Fonts/seguisym.ttf",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
             "/usr/share/fonts/noto/NotoColorEmoji.ttf",
             "/mnt/c/Windows/Fonts/msgothic.ttc",
             "/mnt/c/Windows/Fonts/seguiemj.ttf",
@@ -656,6 +676,30 @@ mod tests {
         let Some(mut f) = font(16.0) else { return };
         let (_, laid_out) = f.layout("the quick brown fox");
         assert!((f.measure_line("the quick brown fox") - laid_out).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fallbacks_are_parsed_only_as_far_as_a_character_needs() {
+        let Some(found) = default_font_candidates()
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+        else {
+            return;
+        };
+        let candidates = ["/no/such/face.ttf", found, "/no/later/face.ttc"];
+        let chain = Mutex::new(Vec::new());
+
+        // A face that has it: the chain stops there.
+        assert!(fallback_from(&candidates, &chain, 'A').is_some());
+        assert_eq!(chain.lock().unwrap().len(), 2);
+
+        // Already parsed: nothing more is read.
+        assert!(fallback_from(&candidates, &chain, 'B').is_some());
+        assert_eq!(chain.lock().unwrap().len(), 2);
+
+        // Nowhere: the rest is tried, once.
+        assert!(fallback_from(&candidates, &chain, '\u{10FFFD}').is_none());
+        assert_eq!(chain.lock().unwrap().len(), 3);
     }
 
     #[test]
