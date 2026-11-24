@@ -55,14 +55,14 @@ fontdue = "0.9"
 # PNG decoding for `Graphics.newImage`. Pure Rust, so image support costs no
 # system dependency, matching fontdue's role for text.
 png = "0.17"
+# Photographs: JPEG, decoded in pure Rust like PNG (`src/image.rs`).
+jpeg-decoder = { version = "0.3", default-features = false }
 # System clipboard for `Clipboard.get` / `Clipboard.set`. minifb has no
 # clipboard of its own. Default features are off so this stays pure Rust:
 # x11rb on Linux and windows-sys here, with no image-data or Wayland backends
 # dragging in C libraries.
 arboard = { version = "3.6.1", default-features = false }
 
-# Sound for `Audio.*`: device output through cpal (ALSA on Linux, so building
-# needs the ALSA development headers), and WAV and Ogg Vorbis decoding in pure
 # The GPU (`src/gpu/`): an OpenGL context on the window minifb opened —
 # EGL or GLX on X11, WGL on Windows, CGL on macOS — found through the raw
 # window handle minifb already exposes, and the GL calls loaded at run time
@@ -72,6 +72,8 @@ glutin = { version = "0.32", default-features = false, features = ["egl", "glx",
 glow = "0.16"
 raw-window-handle = "0.6"
 
+# Sound for `Audio.*`: device output through cpal (ALSA on Linux, so building
+# needs the ALSA development headers), and WAV and Ogg Vorbis decoding in pure
 # Rust.
 rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis"] }
 
@@ -81,12 +83,12 @@ rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis
 # X11 headers are needed, and `libc` provides the SysV shared-memory calls.
 x11-dl = "2.21"
 libc = "0.2"
-# The console backend (`src/state/console/`): the screen through DRM/KMS dumb
-# buffers when there is no X11 or Wayland session — Saule Linux's bare
 # GBM, for drawing on the bare screen through the GPU
 # (`src/state/console/gpu.rs`): loaded at run time, like OpenGL, so a
 # system without Mesa runs the same, drawing on the CPU.
 libloading = "0.8"
+# The console backend (`src/state/console/`): the screen through DRM/KMS dumb
+# buffers when there is no X11 or Wayland session — Saule Linux's bare
 # screen. Pure Rust (rustix ioctls), so it needs no libdrm.
 drm = "0.14"
 

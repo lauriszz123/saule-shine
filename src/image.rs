@@ -1,13 +1,15 @@
-//! Image loading — decode a PNG from disk into a [`Surface`] the rasterizer can
-//! blit.
+//! Image loading — decode a PNG or a JPEG from disk into a [`Surface`] the
+//! rasterizer can blit.
 //!
 //! Images share the engine's surface registry with canvases, so a loaded image
 //! *is* a canvas handle: `Graphics.draw` composites it, `Graphics.drawFrame`
 //! picks a spritesheet cell out of it, and `Graphics.setCanvas` can even draw
 //! into it. That keeps one concept where Love2D has two.
 //!
-//! PNG is the only format: it is lossless, ubiquitous in sprite pipelines, and
-//! `png` is a pure-Rust decoder, so image support adds no system dependency.
+//! PNG for anything drawn (lossless, ubiquitous in sprite pipelines), JPEG for
+//! photographs (a wallpaper is a tenth of the size). Both decoders are pure
+//! Rust, so image support adds no system dependency. Which one is told by
+//! the file's first bytes, not its name.
 
 use std::path::Path;
 
@@ -30,6 +32,9 @@ pub fn load(path: &str) -> Result<Surface, String> {
 /// an asset compiled into the program or fetched over the network needs no
 /// temporary file on the way in. `name` only names the source in errors.
 pub fn decode(bytes: &[u8], path: &str) -> Result<Surface, String> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return decode_jpeg(bytes, path);
+    }
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder
         .read_info()
@@ -93,6 +98,48 @@ pub fn decode(bytes: &[u8], path: &str) -> Result<Surface, String> {
         w: width,
         h: height,
     })
+}
+
+/// Decode a JPEG already held in memory: greyscale, RGB or CMYK, opaque.
+fn decode_jpeg(bytes: &[u8], path: &str) -> Result<Surface, String> {
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let pixels = decoder
+        .decode()
+        .map_err(|e| format!("Graphics.newImage: {path:?} is not a readable JPEG: {e}"))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| format!("Graphics.newImage: {path:?} has no JPEG header"))?;
+    let (width, height) = (usize::from(info.width), usize::from(info.height));
+    if width == 0 || height == 0 {
+        return Err(format!("Graphics.newImage: {path:?} has zero extent"));
+    }
+    let channels = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => 1,
+        jpeg_decoder::PixelFormat::L16 => 2,
+        jpeg_decoder::PixelFormat::RGB24 => 3,
+        jpeg_decoder::PixelFormat::CMYK32 => 4,
+    };
+    if pixels.len() < width * height * channels {
+        return Err(format!("Graphics.newImage: {path:?} is cut short"));
+    }
+    let mut surface = Surface::new(width, height);
+    for (i, out) in surface.buf.iter_mut().enumerate() {
+        let p = &pixels[i * channels..(i + 1) * channels];
+        let (r, g, b) = match info.pixel_format {
+            jpeg_decoder::PixelFormat::L8 => (p[0], p[0], p[0]),
+            jpeg_decoder::PixelFormat::L16 => (p[0], p[0], p[0]),
+            jpeg_decoder::PixelFormat::RGB24 => (p[0], p[1], p[2]),
+            // Adobe's CMYK JPEGs store the inks inverted: each byte is
+            // already how much of the paper shows.
+            jpeg_decoder::PixelFormat::CMYK32 => {
+                let k = u32::from(p[3]);
+                let ink = |c: u8| (u32::from(c) * k / 255) as u8;
+                (ink(p[0]), ink(p[1]), ink(p[2]))
+            }
+        };
+        *out = 0xFF00_0000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+    }
+    Ok(surface)
 }
 
 #[cfg(test)]
