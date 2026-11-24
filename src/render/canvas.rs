@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::geom::Transform;
-use crate::raster::{self, Gradient, Paint, Rect, Surface};
+use crate::raster::{self, BlendMode, Gradient, Paint, Rect, Surface};
 
 /// Pick the destination surface out of a destructured [`Renderer`].
 ///
@@ -43,6 +43,7 @@ impl Renderer {
     }
 
     pub(crate) fn target_mut(&mut self) -> &mut Surface {
+        self.touch_cpu(self.which_target());
         let Renderer {
             screen,
             screen_dirty,
@@ -60,7 +61,11 @@ impl Renderer {
         let bounds = Rect::surface(w, h);
         Paint {
             color: narrow(self.st.color),
-            blend: self.st.blend,
+            // Premultiplied is for images: shapes and text blend as usual.
+            blend: match self.st.blend {
+                BlendMode::Premultiplied => BlendMode::Alpha,
+                other => other,
+            },
             clip: match self.st.scissor {
                 Some(s) => s.intersect(&bounds),
                 None => bounds,
@@ -80,6 +85,7 @@ impl Renderer {
     pub(crate) fn blit_paint(&self) -> Paint {
         Paint {
             gradient: None,
+            blend: self.st.blend,
             ..self.paint()
         }
     }
@@ -243,6 +249,11 @@ impl Renderer {
             .then(&Transform::translation(-ox, -oy));
         let xform = self.st.transform.then(&local);
 
+        if self.gpu_blit(idx, frame, &xform, &paint) {
+            return Ok(());
+        }
+        self.sync_cpu(Which::Canvas(idx));
+
         // Lift the source out of the registry so the source and destination
         // borrows are provably disjoint, then put it straight back.
         let src = self.canvases[idx]
@@ -298,11 +309,13 @@ impl Renderer {
     }
 
     /// Encode a canvas, image, or the screen (handle `0`) as a PNG on disk.
-    pub(crate) fn save_image(&self, handle: i64, path: &str) -> Result<(), String> {
+    pub(crate) fn save_image(&mut self, handle: i64, path: &str) -> Result<(), String> {
         let surface = if handle == 0 {
+            self.sync_cpu(Which::Screen);
             &self.screen
         } else {
             let idx = self.canvas_index(handle, "Graphics.saveImage")?;
+            self.sync_cpu(Which::Canvas(idx));
             self.canvases[idx]
                 .value
                 .as_ref()

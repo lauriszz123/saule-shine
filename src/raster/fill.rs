@@ -69,86 +69,6 @@ pub fn fill_paths_with(
         return;
     }
 
-    let edges = &mut scratch.edges;
-    edges.clear();
-    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
-    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-
-    for path in paths {
-        if path.len() < 3 {
-            continue;
-        }
-        for i in 0..path.len() {
-            let (ax, ay) = path[i];
-            let (bx, by) = path[(i + 1) % path.len()];
-            if !ax.is_finite() || !ay.is_finite() || !bx.is_finite() || !by.is_finite() {
-                continue;
-            }
-            min_x = min_x.min(ax);
-            max_x = max_x.max(ax);
-            min_y = min_y.min(ay);
-            max_y = max_y.max(ay);
-            if ay == by {
-                continue; // horizontal edges are never crossed by a scanline
-            }
-            edges.push(Edge {
-                x0: ax,
-                y0: ay,
-                dxdy: (bx - ax) / (by - ay),
-                y_top: ay.min(by),
-                y_bot: ay.max(by),
-                // Downward edges count +1, upward −1; the running sum is the
-                // winding number that the nonzero rule tests against zero.
-                winding: if ay < by { 1 } else { -1 },
-            });
-        }
-    }
-    if edges.is_empty() {
-        return;
-    }
-
-    let bbox = Rect {
-        x0: min_x,
-        y0: min_y,
-        x1: max_x,
-        y1: max_y,
-    };
-    let (px0, py0, px1, py1) = bbox.intersect(&clip).pixel_bounds(surf.w, surf.h);
-    if px1 <= px0 || py1 <= py0 {
-        return;
-    }
-
-    // Sort by top edge so the active list can be advanced with a cursor rather
-    // than rescanning every edge for every sub-scanline.
-    //
-    // Unstable, because the stable sort allocates a scratch buffer once the
-    // slice passes 20 elements — which a stroked rounded rectangle does easily,
-    // and which showed up as the last allocation in an otherwise steady frame.
-    // Order among equal `y_top` values is not observable: the active list
-    // admits everything starting in the row and retires by `y_bot`.
-    edges.sort_unstable_by(|a, b| {
-        a.y_top
-            .partial_cmp(&b.y_top)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let width = px1 - px0;
-    // Grown, never shrunk, and cleared to zero over exactly the range this
-    // call uses — the fill loop below also hands each row back zeroed, so the
-    // buffer stays clean for the next shape without a full-width wipe.
-    let coverage = &mut scratch.coverage;
-    if coverage.len() < width {
-        coverage.resize(width, 0.0);
-    }
-    let coverage = &mut coverage[..width];
-    let crossings = &mut scratch.crossings;
-    let active = &mut scratch.active;
-    // The column ranges the current row actually covers.
-    let spans = &mut scratch.spans;
-    active.clear();
-    let mut cursor = 0usize;
-
-    let sub_weight = 1.0 / SUBSAMPLES as f32;
     let solid = paint.opaque_pixel();
     // Alpha is the only mode with an integer implementation; the rest keep the
     // general float path.
@@ -157,75 +77,13 @@ pub fn fill_paths_with(
         return; // fully transparent alpha paint writes nothing
     }
 
-    for py in py0..py1 {
-        // The column ranges this row actually covers. A hollow shape — a
-        // border, a focus ring, an outlined card — covers only a sliver at each
-        // edge while its *envelope* is the whole width, so these have to stay
-        // separate rather than collapse into one range. Both the blend scan and
-        // the clear then skip the empty middle, which is the difference between
-        // a 1px outline costing a sliver and costing the whole rectangle it
-        // encloses.
-        spans.clear();
-        let row_bot = py as f64 + 1.0;
-
-        // Admit edges that start within this row, retire ones that ended above.
-        while cursor < edges.len() && edges[cursor].y_top < row_bot {
-            active.push(cursor);
-            cursor += 1;
-        }
-        active.retain(|&i| edges[i].y_bot > py as f64);
-
-        for s in 0..SUBSAMPLES {
-            let sy = py as f64 + (s as f64 + 0.5) / SUBSAMPLES as f64;
-            crossings.clear();
-            for &i in active.iter() {
-                let e = &edges[i];
-                if sy >= e.y_top && sy < e.y_bot {
-                    crossings.push((e.x0 + (sy - e.y0) * e.dxdy, e.winding));
-                }
-            }
-            if crossings.len() < 2 {
-                continue;
-            }
-            // Unstable for the same reason. Two crossings at the same x bound
-            // a zero-width span, so which one is taken first cannot change the
-            // coverage that comes out.
-            crossings.sort_unstable_by(|a, b| {
-                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            let mut winding = 0;
-            let mut span_start = 0.0f64;
-            for &(x, w) in crossings.iter() {
-                let was_inside = winding != 0;
-                winding += w;
-                let is_inside = winding != 0;
-                if !was_inside && is_inside {
-                    span_start = x;
-                } else if was_inside && !is_inside {
-                    let covered = add_span(
-                        coverage,
-                        px0,
-                        px1,
-                        span_start.max(clip.x0),
-                        x.min(clip.x1),
-                        sub_weight,
-                    );
-
-                    if let Some(range) = covered {
-                        spans.push(range);
-                    }
-                }
-            }
-        }
-
-        if spans.is_empty() {
-            continue; // this row is entirely outside the shape
-        }
-        merge_spans(spans);
-
+    let Some(bounds) = prepare_scan(paths, clip, surf.w, surf.h, scratch) else {
+        return;
+    };
+    let px0 = bounds.0;
+    scan_rows(bounds, clip, scratch, |py, coverage, spans| {
         let row = py * surf.w;
-        for &(lo, hi) in spans.iter() {
+        for &(lo, hi) in spans {
             // A gradient sources a different colour per pixel, so none of the
             // run-based shortcuts below apply — every covered pixel is sampled
             // and composited on its own.
@@ -237,7 +95,6 @@ pub fn fill_paths_with(
                         surf.blend(row + x, g.sample(x, py), c, paint.blend);
                     }
                 }
-                coverage[lo..hi].fill(0.0);
                 continue;
             }
 
@@ -308,9 +165,217 @@ pub fn fill_paths_with(
                     }
                 },
             }
+        }
+    });
+}
 
-            // Hand the next row a zeroed buffer. Only what was just used can be
-            // non-zero, so this costs the covered columns, not the bbox width.
+/// The coverage of a set of polygons (nonzero winding, as
+/// [`fill_paths_with`] fills them) as one byte a pixel, for whoever blends
+/// elsewhere: the GPU. `out` gets the box the shape covers, row by row, and
+/// the box comes back as `(x0, y0, width, height)` in device pixels; `None`
+/// when nothing is covered. The bytes are [`cov8`] of the raw coverage, the
+/// paint's antialiasing not yet applied.
+pub(crate) fn coverage_mask(
+    paths: &[Vec<Point>],
+    clip: Rect,
+    surface: (usize, usize),
+    scratch: &mut FillScratch,
+    out: &mut Vec<u8>,
+) -> Option<(usize, usize, usize, usize)> {
+    let clip = clip.intersect(&Rect::surface(surface.0, surface.1));
+    if clip.is_empty() {
+        return None;
+    }
+    let bounds = prepare_scan(paths, clip, surface.0, surface.1, scratch)?;
+    let (px0, py0, px1, py1) = bounds;
+    let width = px1 - px0;
+    out.clear();
+    out.resize(width * (py1 - py0), 0);
+    scan_rows(bounds, clip, scratch, |py, coverage, spans| {
+        let row = (py - py0) * width;
+        for &(lo, hi) in spans {
+            for (dst, &cov) in out[row + lo..row + hi].iter_mut().zip(&coverage[lo..hi]) {
+                *dst = cov8(cov) as u8;
+            }
+        }
+    });
+    Some((px0, py0, width, py1 - py0))
+}
+
+/// Build the edge list for `paths` and find the pixel box they cover within
+/// `clip`: the first half of a scanline fill. `None` when there is nothing.
+fn prepare_scan(
+    paths: &[Vec<Point>],
+    clip: Rect,
+    surf_w: usize,
+    surf_h: usize,
+    scratch: &mut FillScratch,
+) -> Option<(usize, usize, usize, usize)> {
+    let edges = &mut scratch.edges;
+    edges.clear();
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+
+    for path in paths {
+        if path.len() < 3 {
+            continue;
+        }
+        for i in 0..path.len() {
+            let (ax, ay) = path[i];
+            let (bx, by) = path[(i + 1) % path.len()];
+            if !ax.is_finite() || !ay.is_finite() || !bx.is_finite() || !by.is_finite() {
+                continue;
+            }
+            min_x = min_x.min(ax);
+            max_x = max_x.max(ax);
+            min_y = min_y.min(ay);
+            max_y = max_y.max(ay);
+            if ay == by {
+                continue; // horizontal edges are never crossed by a scanline
+            }
+            edges.push(Edge {
+                x0: ax,
+                y0: ay,
+                dxdy: (bx - ax) / (by - ay),
+                y_top: ay.min(by),
+                y_bot: ay.max(by),
+                // Downward edges count +1, upward −1; the running sum is the
+                // winding number that the nonzero rule tests against zero.
+                winding: if ay < by { 1 } else { -1 },
+            });
+        }
+    }
+    if edges.is_empty() {
+        return None;
+    }
+
+    let bbox = Rect {
+        x0: min_x,
+        y0: min_y,
+        x1: max_x,
+        y1: max_y,
+    };
+    let (px0, py0, px1, py1) = bbox.intersect(&clip).pixel_bounds(surf_w, surf_h);
+    if px1 <= px0 || py1 <= py0 {
+        return None;
+    }
+
+    // Sort by top edge so the active list can be advanced with a cursor rather
+    // than rescanning every edge for every sub-scanline.
+    //
+    // Unstable, because the stable sort allocates a scratch buffer once the
+    // slice passes 20 elements — which a stroked rounded rectangle does easily,
+    // and which showed up as the last allocation in an otherwise steady frame.
+    // Order among equal `y_top` values is not observable: the active list
+    // admits everything starting in the row and retires by `y_bot`.
+    edges.sort_unstable_by(|a, b| {
+        a.y_top
+            .partial_cmp(&b.y_top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some((px0, py0, px1, py1))
+}
+
+/// The second half of a scanline fill: each row of the box `prepare_scan`
+/// found, with its coverage (indexed from the box's left edge) and the
+/// column ranges it covers, merged, handed to `row`. The coverage comes back
+/// zeroed for the next row; `row` needn't.
+fn scan_rows(
+    (px0, py0, px1, py1): (usize, usize, usize, usize),
+    clip: Rect,
+    scratch: &mut FillScratch,
+    mut row: impl FnMut(usize, &[f32], &[(usize, usize)]),
+) {
+    let edges = &scratch.edges;
+    let width = px1 - px0;
+    // Grown, never shrunk, and cleared to zero over exactly the range this
+    // call uses — the loop below also hands each row back zeroed, so the
+    // buffer stays clean for the next shape without a full-width wipe.
+    let coverage = &mut scratch.coverage;
+    if coverage.len() < width {
+        coverage.resize(width, 0.0);
+    }
+    let coverage = &mut coverage[..width];
+    let crossings = &mut scratch.crossings;
+    let active = &mut scratch.active;
+    // The column ranges the current row actually covers.
+    let spans = &mut scratch.spans;
+    active.clear();
+    let mut cursor = 0usize;
+
+    let sub_weight = 1.0 / SUBSAMPLES as f32;
+
+    for py in py0..py1 {
+        // The column ranges this row actually covers. A hollow shape — a
+        // border, a focus ring, an outlined card — covers only a sliver at each
+        // edge while its *envelope* is the whole width, so these have to stay
+        // separate rather than collapse into one range. Both the blend scan and
+        // the clear then skip the empty middle, which is the difference between
+        // a 1px outline costing a sliver and costing the whole rectangle it
+        // encloses.
+        spans.clear();
+        let row_bot = py as f64 + 1.0;
+
+        // Admit edges that start within this row, retire ones that ended above.
+        while cursor < edges.len() && edges[cursor].y_top < row_bot {
+            active.push(cursor);
+            cursor += 1;
+        }
+        active.retain(|&i| edges[i].y_bot > py as f64);
+
+        for s in 0..SUBSAMPLES {
+            let sy = py as f64 + (s as f64 + 0.5) / SUBSAMPLES as f64;
+            crossings.clear();
+            for &i in active.iter() {
+                let e = &edges[i];
+                if sy >= e.y_top && sy < e.y_bot {
+                    crossings.push((e.x0 + (sy - e.y0) * e.dxdy, e.winding));
+                }
+            }
+            if crossings.len() < 2 {
+                continue;
+            }
+            // Unstable for the same reason. Two crossings at the same x bound
+            // a zero-width span, so which one is taken first cannot change the
+            // coverage that comes out.
+            crossings.sort_unstable_by(|a, b| {
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let mut winding = 0;
+            let mut span_start = 0.0f64;
+            for &(x, w) in crossings.iter() {
+                let was_inside = winding != 0;
+                winding += w;
+                let is_inside = winding != 0;
+                if !was_inside && is_inside {
+                    span_start = x;
+                } else if was_inside && !is_inside {
+                    let covered = add_span(
+                        coverage,
+                        px0,
+                        px1,
+                        span_start.max(clip.x0),
+                        x.min(clip.x1),
+                        sub_weight,
+                    );
+
+                    if let Some(range) = covered {
+                        spans.push(range);
+                    }
+                }
+            }
+        }
+
+        if spans.is_empty() {
+            continue; // this row is entirely outside the shape
+        }
+        merge_spans(spans);
+        row(py, coverage, spans);
+
+        // Hand the next row a zeroed buffer. Only what was just used can be
+        // non-zero, so this costs the covered columns, not the bbox width.
+        for &(lo, hi) in spans.iter() {
             coverage[lo..hi].fill(0.0);
         }
     }

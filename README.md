@@ -55,6 +55,14 @@ Two halves, deliberately:
   buffers.
 - **`state/`** owns what genuinely needs a window: opening one, pumping its
   queue, latching input, and pacing the frame.
+- **`gpu/`** puts frames on the window through OpenGL (ES 2.0, or desktop 2.1)
+  where the machine has a GPU, and falls back to X11 shared memory or minifb
+  where it hasn't. Drawing moves onto the GPU step by step:
+  [docs/gpu.md](docs/gpu.md) has the plan. `SHINE_GPU=0` turns it off,
+  `SHINE_TRACE_PRESENT=1` says which way frames go, `SHINE_GPU_DRAW=0`
+  keeps drawing on the CPU while still presenting through the GPU, and
+  `SHINE_TRACE_FRAMES=1` reports, with the frame times, how many surfaces
+  were copied between the CPU and the GPU.
 
 The split is what makes the renderer testable. `Renderer::headless(w, h)` draws
 into an offscreen surface with no display anywhere, so transforms, scissor

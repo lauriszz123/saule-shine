@@ -330,6 +330,9 @@ impl Renderer {
             Some(s) => s.intersect(&Rect::surface(w, h)),
             None => Rect::surface(w, h),
         };
+        if self.gpu_clear(c, clip) {
+            return;
+        }
         self.target_mut().clear(c, clip);
     }
 
@@ -373,18 +376,7 @@ impl Renderer {
             }
         };
 
-        // The scratch buffers and the destination surface are both borrowed
-        // for the duration of the fill, so the fields are destructured to make
-        // the two provably disjoint.
-        let Renderer {
-            screen,
-            screen_dirty,
-            canvases,
-            target,
-            scratch,
-            ..
-        } = self;
-
+        let scratch = &mut self.scratch;
         scratch.device.clear();
         scratch
             .device
@@ -404,9 +396,30 @@ impl Renderer {
             scratch.paths.push_slice(&scratch.device);
         }
 
-        let surf = surface_of(screen, screen_dirty, canvases, *target);
-        raster::fill_paths_with(surf, scratch.paths.paths(), &paint, &mut scratch.fill);
+        self.fill_scratch_paths(&paint);
         Ok(())
+    }
+
+    /// Fill the device-space paths in the scratch buffers with `paint`: on
+    /// the GPU when it can, else on the CPU.
+    pub(crate) fn fill_scratch_paths(&mut self, paint: &raster::Paint) {
+        if self.gpu_fill(paint) {
+            return;
+        }
+        // The scratch buffers and the destination surface are both borrowed
+        // for the duration of the fill, so the fields are destructured to make
+        // the two provably disjoint.
+        self.touch_cpu(self.which_target());
+        let Renderer {
+            screen,
+            screen_dirty,
+            canvases,
+            target,
+            scratch,
+            ..
+        } = self;
+        let surf = surface_of(screen, screen_dirty, canvases, *target);
+        raster::fill_paths_with(surf, scratch.paths.paths(), paint, &mut scratch.fill);
     }
 
     /// Segment budget for a curve of local radius `r` under the current
@@ -626,15 +639,7 @@ impl Renderer {
         let t = self.st.transform;
         let paint = self.paint();
 
-        let Renderer {
-            screen,
-            screen_dirty,
-            canvases,
-            target,
-            scratch,
-            ..
-        } = self;
-
+        let scratch = &mut self.scratch;
         scratch.paths.begin();
         for &(x, y) in points {
             let (dx, dy) = t.apply(x, y);
@@ -647,8 +652,7 @@ impl Renderer {
             ]);
         }
 
-        let surf = surface_of(screen, screen_dirty, canvases, *target);
-        raster::fill_paths_with(surf, scratch.paths.paths(), &paint, &mut scratch.fill);
+        self.fill_scratch_paths(&paint);
     }
 }
 

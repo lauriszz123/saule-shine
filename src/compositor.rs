@@ -51,7 +51,7 @@ use crate::state;
 
 /// Something that happened to a window, for `Compositor.poll`.
 enum Happened {
-    Opened(i64, String, i64, i64),
+    Opened(i64, String, i64, i64, bool),
     Frame(i64),
     Title(i64, String),
     Cursor(i64, String),
@@ -62,8 +62,8 @@ enum Happened {
 #[saule_enum]
 #[derive(Clone, Copy, PartialEq)]
 pub enum WindowEventKind {
-    /// An app opened a window: `id`, `title`, and the `width` and `height`
-    /// it asked for.
+    /// An app opened a window: `id`, `title`, the `width` and `height` it
+    /// asked for, and whether it is `resizable`.
     Opened,
     /// The window has new pixels in `Compositor.image(id)`.
     Frame,
@@ -86,6 +86,7 @@ pub struct WindowEvent {
     title: String,
     width: i64,
     height: i64,
+    resizable: bool,
     cursor: String,
 }
 
@@ -97,16 +98,18 @@ impl WindowEvent {
             title: String::new(),
             width: 0,
             height: 0,
+            resizable: true,
             cursor: String::new(),
         }
     }
 
     fn from_happened(h: Happened) -> Self {
         match h {
-            Happened::Opened(id, title, width, height) => WindowEvent {
+            Happened::Opened(id, title, width, height, resizable) => WindowEvent {
                 title,
                 width,
                 height,
+                resizable,
                 ..WindowEvent::blank(WindowEventKind::Opened, id)
             },
             Happened::Frame(id) => WindowEvent::blank(WindowEventKind::Frame, id),
@@ -158,6 +161,14 @@ impl WindowEvent {
         self.height
     }
 
+    /// Whether the app lets its window be resized, for `Opened`: one that
+    /// doesn't (an About box, a dialog) is drawn at the size it asked for,
+    /// which a window manager might take as a sign it should float.
+    #[saule(getter)]
+    pub fn resizable(&self) -> bool {
+        self.resizable
+    }
+
     /// The cursor's name, for `Cursor`.
     #[saule(getter)]
     pub fn cursor(&self) -> String {
@@ -182,6 +193,12 @@ struct Win {
     /// The latest frame, as the image `Compositor.image` hands out — one
     /// object, kept, so every call returns the same image.
     image: Option<(SObject<Image>, i64, i64)>,
+    /// Two GPU buffers the app shared for its frames (`attachShared`), and
+    /// their size, until the next frame takes them into the renderer.
+    #[cfg(target_os = "linux")]
+    shared: Option<([crate::gpu::dmabuf::DmaBuf; 2], i64, i64)>,
+    /// The size of the buffers last shared: what a shared frame is.
+    shared_size: (i64, i64),
 }
 
 struct Server {
@@ -228,6 +245,50 @@ impl Apps {
             .ok_or_else(|| format!("no window {id} of yours"))
     }
 
+    /// The window's image, `w` × `h`: the one it has, or a new one when
+    /// there is none or it is another size.
+    fn image_for(id: i64, image: Option<(SObject<Image>, i64, i64)>, w: i64, h: i64) -> Result<i64, String> {
+        match image {
+            Some((img, iw, ih)) if (iw, ih) == (w, h) => Ok(img.borrow()?.handle),
+            _ => {
+                let handle = state::draw(|g| g.new_blank_image(w, h))??;
+                let img = SObject::new(Image::from_handle(handle)?);
+                with_server(|s| {
+                    if let Some(win) = s.windows.get_mut(&id) {
+                        win.image = Some((img, w, h));
+                    }
+                    Ok(())
+                })?;
+                Ok(handle)
+            }
+        }
+    }
+
+    /// Show the app's frame `index` from the buffers it shared: nothing is
+    /// copied, the window's image is that buffer (see
+    /// `Renderer::show_shared_frame`). An error when the GPU can't take the
+    /// buffers, which tells the app to send pixels instead.
+    #[cfg(target_os = "linux")]
+    fn commit_shared(from: ConnId, id: i64, index: usize) -> Result<(), String> {
+        let (buffers, (w, h), image) = with_server(|s| {
+            let win = Apps::owned(s, from, id)?;
+            Ok((win.shared.take(), win.shared_size, win.image.clone()))
+        })?;
+        if w <= 0 || h <= 0 {
+            return Err("a shared frame before any shared buffers".into());
+        }
+        let handle = Apps::image_for(id, image, w, h)?;
+        state::draw(|g| {
+            let idx = g.canvas_index(handle, "Compositor")?;
+            let buffers = buffers.as_ref().map(|(b, w, h)| (b, *w as usize, *h as usize));
+            g.show_shared_frame(idx, buffers, index)
+        })??;
+        with_server(|s| {
+            s.happened.push(Happened::Frame(id));
+            Ok(())
+        })
+    }
+
     /// Make the app's latest frame the window's image.
     fn commit(from: ConnId, id: i64) -> Result<(), String> {
         // Read the frame and what image there is, then let go of the server
@@ -242,20 +303,7 @@ impl Apps {
                 win.image.clone(),
             ))
         })?;
-        let handle = match image {
-            Some((img, iw, ih)) if (iw, ih) == (w, h) => img.borrow()?.handle,
-            _ => {
-                let handle = state::draw(|g| g.new_blank_image(w, h))??;
-                let img = SObject::new(Image::from_handle(handle)?);
-                with_server(|s| {
-                    if let Some(win) = s.windows.get_mut(&id) {
-                        win.image = Some((img, w, h));
-                    }
-                    Ok(())
-                })?;
-                handle
-            }
-        };
+        let handle = Apps::image_for(id, image, w, h)?;
         state::draw(|g| g.upload_opaque(handle, &pixels))??;
         with_server(|s| {
             s.happened.push(Happened::Frame(id));
@@ -275,10 +323,20 @@ impl Handler for Apps {
     ) -> Result<Vec<Wire>, String> {
         match method {
             "createWindow" => {
-                let [Wire::Str(title), w, h, Wire::Object(ObjRef::Remote { id: events, .. })] =
-                    args.as_slice()
-                else {
-                    return Err("createWindow(title, w, h, events)".into());
+                // `resizable` came later, last: a client from before it
+                // sends four, and its window is resizable, as they all were.
+                let (title, w, h, events, resizable) = match args.as_slice() {
+                    [Wire::Str(title), w, h, Wire::Object(ObjRef::Remote { id: events, .. })] => {
+                        (title, w, h, events, true)
+                    }
+                    [
+                        Wire::Str(title),
+                        w,
+                        h,
+                        Wire::Object(ObjRef::Remote { id: events, .. }),
+                        Wire::Bool(resizable),
+                    ] => (title, w, h, events, *resizable),
+                    _ => return Err("createWindow(title, w, h, events, resizable?)".into()),
                 };
                 let (w, h) = (int(w)?, int(h)?);
                 let pid = looper.peer(from).and_then(|p| p.pid);
@@ -296,9 +354,12 @@ impl Handler for Apps {
                             pid,
                             frame: None,
                             image: None,
+                            #[cfg(target_os = "linux")]
+                            shared: None,
+                            shared_size: (0, 0),
                         },
                     );
-                    s.happened.push(Happened::Opened(id, title, w, h));
+                    s.happened.push(Happened::Opened(id, title, w, h, resizable));
                     Ok(vec![Wire::Int(id)])
                 })
             }
@@ -326,6 +387,49 @@ impl Handler for Apps {
             "commit" => {
                 let id = int(args.first().ok_or("commit(id)")?)?;
                 Apps::commit(from, id)?;
+                Ok(Vec::new())
+            }
+            // An app drawing on the GPU shares two buffers for its frames
+            // instead of shared memory: what each holds is described with
+            // it, as dma-buf importers need (see `gpu::dmabuf`).
+            #[cfg(target_os = "linux")]
+            "attachShared" => {
+                let mut args = args.into_iter();
+                let id = int(&args.next().ok_or("attachShared(id, …)")?)?;
+                let (w, h) = (int(&args.next().ok_or("attachShared: w")?)?, int(&args.next().ok_or("attachShared: h")?)?);
+                if w <= 0 || h <= 0 || w > 16384 || h > 16384 {
+                    return Err(format!("attachShared: a {w}×{h} frame"));
+                }
+                let mut buffers = Vec::with_capacity(2);
+                for _ in 0..2 {
+                    let (Some(Wire::Fd(fd)), Some(fourcc), Some(stride), Some(offset), Some(modifier)) =
+                        (args.next(), args.next(), args.next(), args.next(), args.next())
+                    else {
+                        return Err("attachShared(id, w, h, [fd, fourcc, stride, offset, modifier] × 2)".into());
+                    };
+                    buffers.push(crate::gpu::dmabuf::DmaBuf {
+                        fd,
+                        fourcc: int(&fourcc)? as u32,
+                        stride: int(&stride)? as u32,
+                        offset: int(&offset)? as u32,
+                        modifier: int(&modifier)? as u64,
+                    });
+                }
+                let second = buffers.pop().expect("two read");
+                let first = buffers.pop().expect("two read");
+                with_server(|s| {
+                    let win = Apps::owned(s, from, id)?;
+                    win.shared = Some(([first, second], w, h));
+                    win.shared_size = (w, h);
+                    Ok(Vec::new())
+                })
+            }
+            #[cfg(target_os = "linux")]
+            "commitShared" => {
+                let [id, index] = args.as_slice() else {
+                    return Err("commitShared(id, index)".into());
+                };
+                Apps::commit_shared(from, int(id)?, int(index)? as usize)?;
                 Ok(Vec::new())
             }
             "setTitle" | "setCursor" => {

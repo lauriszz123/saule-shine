@@ -42,6 +42,19 @@ pub(crate) trait Backend {
     /// [`Backend::pump`] does.
     fn present(&mut self, buf: &[u32], w: usize, h: usize) -> Result<(), String>;
 
+    /// The GPU this backend presents through, for the renderer to draw on
+    /// too; `None` without one.
+    fn gpu_device(&self) -> Option<std::rc::Rc<crate::gpu::Device>> {
+        None
+    }
+
+    /// Show a frame the GPU drew (the screen's texture) without reading it
+    /// back. `false` when this backend can't, and the CPU's copy has to be
+    /// presented instead.
+    fn present_texture(&mut self, _texture: &crate::gpu::Texture) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// The backend has a reason to show a frame even though nothing new was
     /// drawn — a cursor it draws itself has moved, say.
     fn wants_present(&self) -> bool {

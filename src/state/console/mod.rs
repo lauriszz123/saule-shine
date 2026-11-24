@@ -10,6 +10,7 @@
 
 mod cursor;
 mod display;
+mod gpu;
 mod input;
 mod keymap;
 mod vt;
@@ -40,6 +41,10 @@ pub(super) fn wanted() -> bool {
 }
 
 pub(super) struct Console {
+    /// Drawing on the screen through the GPU, where there is one and the
+    /// driver shows the cursor itself (see `gpu`). First, so it goes before
+    /// the display whose device it draws on.
+    gpu: Option<gpu::ConsoleGpu>,
     input: Input,
     display: Display,
     /// Dropped last: the terminal comes back once the screen is let go.
@@ -59,6 +64,7 @@ impl Console {
         let display = Display::open().map_err(|e| format!("Window.create: {e}"))?;
         let input = Input::open(display.size());
         let mut console = Console {
+            gpu: None,
             input,
             display,
             _vt: vt,
@@ -68,6 +74,25 @@ impl Console {
             shown: None,
         };
         console.upload_cursor();
+        // The GPU only with the hardware cursor: a cursor drawn into the
+        // frames is drawn by the CPU, into the CPU's copy.
+        if console.hardware_cursor {
+            match gpu::ConsoleGpu::new(&console.display) {
+                Ok(gpu) => {
+                    if crate::gpu::tracing() {
+                        if let Some(dev) = gpu.device() {
+                            eprintln!("shine: drawing on the GPU: {}", dev.description);
+                        }
+                    }
+                    console.gpu = Some(gpu);
+                }
+                Err(e) => {
+                    if crate::gpu::tracing() {
+                        eprintln!("shine: no GPU to draw on ({e}); drawing on the CPU");
+                    }
+                }
+            }
+        }
         Ok(console)
     }
 
@@ -142,6 +167,25 @@ impl Backend for Console {
         });
         self.shown = drawn;
         Ok(())
+    }
+
+    fn gpu_device(&self) -> Option<std::rc::Rc<crate::gpu::Device>> {
+        self.gpu.as_ref().and_then(|g| g.device())
+    }
+
+    fn present_texture(&mut self, texture: &crate::gpu::Texture) -> Result<bool, String> {
+        self.pump();
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Ok(false);
+        };
+        if let Err(e) = gpu.present(&mut self.display, texture) {
+            if crate::gpu::tracing() {
+                eprintln!("shine: the GPU failed ({e}); drawing on the CPU");
+            }
+            self.gpu = None;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn wants_present(&self) -> bool {

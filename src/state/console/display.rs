@@ -250,6 +250,45 @@ impl Display {
         (self.width, self.height)
     }
 
+    /// The DRM device, for GBM to allocate on (see `console::gpu`).
+    pub(super) fn card(&self) -> &std::fs::File {
+        &self.card.0
+    }
+
+    /// A framebuffer for a buffer the GPU drew: GEM `handle`, rows `stride`
+    /// bytes apart, XRGB8888.
+    pub(super) fn add_framebuffer(
+        &self,
+        handle: u32,
+        stride: u32,
+        width: u32,
+        height: u32,
+    ) -> io::Result<framebuffer::Handle> {
+        let buffer = GemBuffer {
+            handle,
+            stride,
+            size: (width, height),
+        };
+        self.card.add_framebuffer(&buffer, 24, 32)
+    }
+
+    /// Show framebuffer `fb`: flipped to at the next refresh, after the
+    /// flip before it has landed, as `present` shows a dumb buffer.
+    pub(super) fn flip_to(&mut self, fb: framebuffer::Handle) {
+        self.wait_for_flip();
+        if self.flipping {
+            match self.card.page_flip(self.crtc, fb, PageFlipFlags::EVENT, None) {
+                Ok(()) => {
+                    self.flip_pending = true;
+                    return;
+                }
+                Err(_) => self.flipping = false,
+            }
+        }
+        let _ = self.card.set_crtc_fb(self.crtc, fb);
+        let _ = self.card.dirty_framebuffer(fb, &[]);
+    }
+
     /// Show `buf` (`w`×`h`, `0x00RRGGBB`), letting `overlay` paint over it on
     /// the way — the cursor, when there is no hardware one.
     ///
@@ -430,4 +469,32 @@ fn preferred_mode(modes: &[Mode]) -> Mode {
         .or_else(|| has(ModeTypeFlags::PREFERRED))
         .unwrap_or(&modes[0])
         .to_owned()
+}
+
+/// A buffer the GPU allocated (a GBM buffer), as DRM takes one to make a
+/// framebuffer of it.
+struct GemBuffer {
+    handle: u32,
+    stride: u32,
+    size: (u32, u32),
+}
+
+impl Buffer for GemBuffer {
+    fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    fn format(&self) -> DrmFourcc {
+        DrmFourcc::Xrgb8888
+    }
+
+    fn pitch(&self) -> u32 {
+        self.stride
+    }
+
+    fn handle(&self) -> drm::buffer::Handle {
+        drm::buffer::Handle::from(
+            std::num::NonZeroU32::new(self.handle).expect("GEM handles are never 0"),
+        )
+    }
 }

@@ -44,6 +44,16 @@ pub(crate) fn declare_dpi_aware() {}
 pub(crate) const DEFAULT_FRAME_DUR: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
 impl Engine {
+    /// Draw on the GPU the backend presents through, once it has one; and
+    /// stop, keeping every pixel, if the backend lost it.
+    pub(crate) fn follow_gpu(&mut self) {
+        match self.backend.gpu_device() {
+            Some(dev) if !self.r.on_gpu() => self.r.attach_gpu(dev),
+            None if self.r.on_gpu() => self.r.detach_gpu(true),
+            _ => {}
+        }
+    }
+
     /// `true` while the OS window is open.
     ///
     /// Escape only ends the loop when `Window.setQuitOnEscape(true)` asked for
@@ -177,12 +187,22 @@ impl Engine {
 
         if self.r.screen_dirty || stale || self.backend.wants_present() {
             let Engine { backend, r, .. } = self;
-            backend.present(&r.screen.buf, r.screen.w, r.screen.h)?;
+            // A frame the GPU drew goes straight to the window; one the CPU
+            // drew (or the GPU could not show) goes as its pixels.
+            let shown = match r.screen_texture() {
+                Some(texture) => backend.present_texture(texture)?,
+                None => false,
+            };
+            if !shown {
+                r.sync_cpu(crate::render::Which::Screen);
+                backend.present(&r.screen.buf, r.screen.w, r.screen.h)?;
+            }
             self.r.screen_dirty = false;
             self.last_blit = Instant::now();
         } else {
             self.backend.pump();
         }
+        self.follow_gpu();
 
         crate::timer::mark_frame();
 

@@ -84,6 +84,14 @@ pub struct Engine {
     pub(crate) close_reported: bool,
 }
 
+impl Drop for Engine {
+    /// The renderer's textures go before the backend does: they live on its
+    /// GPU context, and the window that context draws on goes with it.
+    fn drop(&mut self) {
+        self.r.detach_gpu(false);
+    }
+}
+
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
 }
@@ -138,6 +146,13 @@ pub fn create(width: i64, height: i64, title: &str, resizable: bool) -> Result<(
             quit_on_escape: false,
             close_reported: false,
         });
+        // A backend with its GPU ready already (an app inside a Saule
+        // display server, the bare screen) draws the first frame on it too:
+        // an app that draws once and then waits would otherwise keep that
+        // frame on the CPU, and send it as pixels, for as long as it shows.
+        if let Some(engine) = cell.borrow_mut().as_mut() {
+            engine.follow_gpu();
+        }
     });
     Ok(())
 }
@@ -162,7 +177,7 @@ fn open_backend(
         && !crate::compositor::serving(&service)
     {
         return Ok(Box::new(client::Client::open(
-            &service, title, width, height,
+            &service, title, width, height, resizable,
         )?));
     }
     #[cfg(target_os = "linux")]

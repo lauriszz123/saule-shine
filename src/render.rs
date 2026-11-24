@@ -10,17 +10,22 @@
 //! [`crate::state::Engine`] owns a `Renderer` alongside the OS window and
 //! forwards the drawing calls to it.
 
+mod blur;
 mod canvas;
 mod draw;
+mod mirror;
 mod pixels;
 mod scratch;
 mod text;
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, target_os = "linux"))]
+mod gpu_tests;
 
 pub(crate) use canvas::*;
 pub(crate) use draw::*;
+pub(crate) use mirror::{GpuState, Which};
 pub(crate) use scratch::*;
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -59,6 +64,9 @@ pub struct Renderer {
     pub(crate) linear_filter: bool,
     /// Reusable working buffers, so a frame of drawing allocates nothing.
     pub(crate) scratch: Scratch,
+    /// The GPU, and the surfaces' textures on it, while drawing goes there
+    /// (see `mirror`): `None` draws everything on the CPU.
+    pub(crate) gpu: Option<GpuState>,
 }
 
 impl Renderer {
@@ -78,6 +86,7 @@ impl Renderer {
             stack: Vec::new(),
             linear_filter: true,
             scratch: Scratch::default(),
+            gpu: None,
         }
     }
 
@@ -95,6 +104,7 @@ impl Renderer {
     pub(crate) fn resize_screen(&mut self, width: usize, height: usize) {
         self.screen = Surface::opaque(width, height);
         self.screen_dirty = true;
+        self.forget_screen();
         self.st.scissor = None;
     }
 }
@@ -243,6 +253,7 @@ impl Renderer {
 
         self.canvases[idx] = Slot::free();
         self.free_canvases.push(idx);
+        self.forget_canvas(idx);
         Ok(())
     }
 

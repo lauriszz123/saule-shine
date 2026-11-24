@@ -907,3 +907,38 @@ fn a_turned_outline_is_still_drawn() {
     r.rectangle("line", 20.0, 10.0, 40.0, 30.0, 6.0, 6.0).expect("rotated");
     assert!(r.written() > 0);
 }
+
+/// A translucent panel drawn into a transparent layer, and the layer drawn
+/// back premultiplied, looks as the panel drawn straight on would: the
+/// layer's colours are weighed by their alpha already, and must not be
+/// weighed twice (which darkened a menu fading in).
+#[test]
+fn a_layer_drawn_premultiplied_matches_drawing_it_directly() {
+    let paint = |r: &mut Renderer| -> Result<(), String> {
+        r.set_color(0.1, 0.1, 0.14, 0.55);
+        r.rectangle("fill", 4.0, 4.0, 40.0, 24.0, 0.0, 0.0)?;
+        r.set_color(1.0, 0.9, 0.3, 0.8);
+        r.rectangle("fill", 10.0, 10.0, 12.0, 8.0, 0.0, 0.0)
+    };
+    let mut direct = Renderer::new(48, 32);
+    direct.clear(Some((0.2, 0.5, 0.8, 1.0)));
+    paint(&mut direct).unwrap();
+
+    let mut layered = Renderer::new(48, 32);
+    layered.clear(Some((0.2, 0.5, 0.8, 1.0)));
+    let layer = layered.new_canvas(48, 32).unwrap();
+    layered.set_canvas(Some(layer)).unwrap();
+    layered.clear(Some((0.0, 0.0, 0.0, 0.0)));
+    paint(&mut layered).unwrap();
+    layered.set_canvas(None).unwrap();
+    layered.set_blend_mode("premultiplied").unwrap();
+    layered.set_color(1.0, 1.0, 1.0, 1.0);
+    layered.draw_canvas(layer, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0).unwrap();
+
+    for (i, (&a, &b)) in direct.screen.buf.iter().zip(&layered.screen.buf).enumerate() {
+        for shift in [0, 8, 16] {
+            let (ca, cb) = ((a >> shift) & 0xFF, (b >> shift) & 0xFF);
+            assert!(ca.abs_diff(cb) <= 2, "pixel {i}: {a:08x} drawn, {b:08x} layered");
+        }
+    }
+}

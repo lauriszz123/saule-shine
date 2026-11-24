@@ -1,6 +1,7 @@
 //! The desktop backend: a minifb window on X11, Windows or macOS, plus the
-//! per-platform DPI queries minifb lacks and, on Linux, presenting through
-//! X11 shared memory.
+//! per-platform DPI queries minifb lacks, and presenting frames through the
+//! GPU (`crate::gpu`) — or, without one, through X11 shared memory on Linux
+//! and minifb elsewhere.
 
 use minifb::{CursorStyle, Key, MouseButton, MouseMode, Scale, Window, WindowOptions};
 
@@ -13,6 +14,13 @@ use crate::keyboard::TextCollector;
 const WHEEL_NOTCH: f64 = 12.0;
 
 pub(crate) struct Desktop {
+    /// Presents frames through OpenGL when the window can have a context
+    /// (see `crate::gpu`). Made at the first frame; `None` until then, and
+    /// for good once it has failed. Declared first so it is dropped first,
+    /// while the window its surface is on still exists.
+    gpu: Option<crate::gpu::Presenter>,
+    /// Whether a GPU context has been tried, so a failure is tried once.
+    gpu_tried: bool,
     /// Presents frames through X11 shared memory instead of minifb's
     /// `XPutImage` when the server allows it (see `state/shm.rs`). `None`
     /// means minifb presents. Declared before `window` so it is dropped
@@ -90,16 +98,24 @@ impl Desktop {
             } else {
                 "minifb"
             };
-            eprintln!("shine: presenting through {how}");
+            if crate::gpu::wanted() {
+                eprintln!("shine: without a GPU, frames would go through {how}");
+            } else {
+                eprintln!("shine: presenting through {how} (SHINE_GPU=0)");
+            }
         }
 
-        Ok(Desktop {
+        let mut desktop = Desktop {
+            gpu: None,
+            gpu_tried: !crate::gpu::wanted(),
             #[cfg(target_os = "linux")]
             shm,
             window,
             wheel: (0.0, 0.0),
             pending_position,
-        })
+        };
+        desktop.start_gpu();
+        Ok(desktop)
     }
 
     /// Move the window to where it was asked to go, once it is on screen.
@@ -120,6 +136,58 @@ impl Desktop {
         self.wheel = self.window.get_scroll_wheel().map_or((0.0, 0.0), |(x, y)| {
             (f64::from(x) / WHEEL_NOTCH, f64::from(y) / WHEEL_NOTCH)
         });
+    }
+
+    /// Make the GPU context, the first time only: when the window opens, so
+    /// the first frame is drawn on the GPU too.
+    fn start_gpu(&mut self) {
+        if self.gpu_tried {
+            return;
+        }
+        self.gpu_tried = true;
+        let (win_w, win_h) = self.drawable_size();
+        match crate::gpu::Presenter::new(&self.window, win_w, win_h) {
+            Ok(presenter) => {
+                if crate::gpu::tracing() {
+                    eprintln!("shine: presenting through the GPU: {}", presenter.dev.description);
+                }
+                self.gpu = Some(presenter);
+            }
+            Err(e) => {
+                if crate::gpu::tracing() {
+                    eprintln!("shine: no GPU ({e}); presenting without one");
+                }
+            }
+        }
+    }
+
+    /// Put the framebuffer on screen through the GPU, then pump the window's
+    /// events. `false` when there is no GPU to do it: none found, or one
+    /// that failed, after which it is dropped for good and the frames go the
+    /// way they would without one.
+    fn present_gpu(&mut self, buf: &[u32], w: usize, h: usize) -> bool {
+        self.start_gpu();
+        let (win_w, win_h) = self.drawable_size();
+        let Some(gpu) = self.gpu.as_mut() else {
+            return false;
+        };
+        if let Err(e) = gpu.present(buf, w, h, win_w, win_h) {
+            if crate::gpu::tracing() {
+                eprintln!("shine: the GPU failed ({e}); presenting without it");
+            }
+            self.gpu = None;
+            return false;
+        }
+        self.window.update();
+        true
+    }
+
+    /// The window's drawable size in pixels: its size in pointer units
+    /// times the backing scale (2 on a Retina Mac).
+    fn drawable_size(&self) -> (usize, usize) {
+        let (w, h) = self.window.get_size();
+        let scale = self.backing_scale();
+        ((w as f64 * scale).round() as usize, (h as f64 * scale).round() as usize)
     }
 
     /// Put the framebuffer on screen through shared memory, then pump the
@@ -174,7 +242,7 @@ impl Backend for Desktop {
     }
 
     fn present(&mut self, buf: &[u32], w: usize, h: usize) -> Result<(), String> {
-        if !self.present_shared(buf, w, h) {
+        if !self.present_gpu(buf, w, h) && !self.present_shared(buf, w, h) {
             self.window
                 .update_with_buffer(buf, w, h)
                 .map_err(|e| format!("Graphics.present: {e}"))?;
@@ -182,6 +250,28 @@ impl Backend for Desktop {
         self.read_wheel();
         self.place();
         Ok(())
+    }
+
+    fn gpu_device(&self) -> Option<std::rc::Rc<crate::gpu::Device>> {
+        self.gpu.as_ref().map(|g| std::rc::Rc::clone(&g.dev))
+    }
+
+    fn present_texture(&mut self, texture: &crate::gpu::Texture) -> Result<bool, String> {
+        let (win_w, win_h) = self.drawable_size();
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Ok(false);
+        };
+        if let Err(e) = gpu.present_texture(texture, win_w, win_h) {
+            if crate::gpu::tracing() {
+                eprintln!("shine: the GPU failed ({e}); presenting without it");
+            }
+            self.gpu = None;
+            return Ok(false);
+        }
+        self.window.update();
+        self.read_wheel();
+        self.place();
+        Ok(true)
     }
 
     fn keys_down(&self) -> Vec<Key> {

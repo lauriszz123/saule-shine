@@ -17,14 +17,16 @@ impl Renderer {
     /// The pixels behind an image or canvas handle, for writing.
     fn pixels_mut(&mut self, handle: i64, func: &str) -> Result<&mut Surface, String> {
         let idx = self.canvas_index(handle, func)?;
+        self.touch_cpu(Which::Canvas(idx));
         self.canvases[idx]
             .value
             .as_mut()
             .ok_or_else(|| format!("{func}: the image is on loan to a draw call"))
     }
 
-    fn pixels(&self, handle: i64, func: &str) -> Result<&Surface, String> {
+    fn pixels(&mut self, handle: i64, func: &str) -> Result<&Surface, String> {
         let idx = self.canvas_index(handle, func)?;
+        self.sync_cpu(Which::Canvas(idx));
         self.canvases[idx]
             .value
             .as_ref()
@@ -47,7 +49,7 @@ impl Renderer {
     }
 
     /// The colour at `(x, y)`, or `0` (transparent) outside the image.
-    pub(crate) fn get_pixel(&self, handle: i64, x: i64, y: i64) -> Result<u32, String> {
+    pub(crate) fn get_pixel(&mut self, handle: i64, x: i64, y: i64) -> Result<u32, String> {
         let s = self.pixels(handle, "Image.getPixel")?;
         Ok(at(s, x, y).map(|i| s.buf[i]).unwrap_or(0))
     }
@@ -209,6 +211,11 @@ impl Renderer {
     /// made fully opaque, since a framebuffer's alpha byte means nothing.
     /// The frame must be the image's size.
     pub(crate) fn upload_opaque(&mut self, handle: i64, frame: &[u8]) -> Result<(), String> {
+        let idx = self.canvas_index(handle, "Compositor")?;
+        let size = self.canvases[idx].value.as_ref().map(|s| s.w * s.h * 4);
+        if size.is_some_and(|n| frame.len() >= n) && self.upload_frame(idx, frame) {
+            return Ok(());
+        }
         let dst = self.pixels_mut(handle, "Compositor")?;
         if frame.len() < dst.buf.len() * 4 {
             return Err("Compositor: a frame smaller than its window".into());

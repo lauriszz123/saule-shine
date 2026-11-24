@@ -63,6 +63,15 @@ arboard = { version = "3.6.1", default-features = false }
 
 # Sound for `Audio.*`: device output through cpal (ALSA on Linux, so building
 # needs the ALSA development headers), and WAV and Ogg Vorbis decoding in pure
+# The GPU (`src/gpu/`): an OpenGL context on the window minifb opened —
+# EGL or GLX on X11, WGL on Windows, CGL on macOS — found through the raw
+# window handle minifb already exposes, and the GL calls loaded at run time
+# through glow. Nothing links against a GL library, so a machine without one
+# builds and runs the same, drawing on the CPU.
+glutin = { version = "0.32", default-features = false, features = ["egl", "glx", "x11", "wgl"] }
+glow = "0.16"
+raw-window-handle = "0.6"
+
 # Rust.
 rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis"] }
 
@@ -74,6 +83,10 @@ x11-dl = "2.21"
 libc = "0.2"
 # The console backend (`src/state/console/`): the screen through DRM/KMS dumb
 # buffers when there is no X11 or Wayland session — Saule Linux's bare
+# GBM, for drawing on the bare screen through the GPU
+# (`src/state/console/gpu.rs`): loaded at run time, like OpenGL, so a
+# system without Mesa runs the same, drawing on the CPU.
+libloading = "0.8"
 # screen. Pure Rust (rustix ioctls), so it needs no libdrm.
 drm = "0.14"
 

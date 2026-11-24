@@ -49,6 +49,7 @@ mod event;
 mod events;
 mod font;
 mod geom;
+mod gpu;
 mod graphics;
 mod image;
 mod keyboard;

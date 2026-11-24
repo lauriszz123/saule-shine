@@ -5,6 +5,15 @@
 //! frames go out through shared memory, input comes in as calls from the
 //! server, and the size is whatever the server configures — so a program
 //! written for a desktop window runs here unchanged.
+//!
+//! It draws on the GPU too, where there is one: with no window of its own it
+//! has a context on no surface (`gpu::Device::headless`), the renderer draws
+//! into the screen's texture, and each frame is read straight from that
+//! texture into the shared memory the server reads. The server puts it
+//! straight into its own texture (`Renderer::upload_frame`), so the pixels
+//! cross from one GPU to the other through one buffer, untouched by either
+//! side's CPU drawing. (Handing the GPU buffer itself over, as a dma-buf,
+//! would save that last read; see `docs/gpu.md`.)
 
 use std::time::Duration;
 
@@ -140,10 +149,26 @@ pub(crate) struct Client {
     frame: Option<Frame>,
     /// The wheel movement of the last pump, as the engine reads it.
     wheel: (f64, f64),
+    /// The GPU the renderer draws with, when there is one.
+    gpu: Option<std::rc::Rc<crate::gpu::Device>>,
+    /// Frames handed over as GPU buffers the server shares (see
+    /// `present_shared`): the two buffers, which one is next, and whether
+    /// sharing is still worth trying (the server or the driver may refuse,
+    /// once, and pixels go through shared memory from then on).
+    #[cfg(target_os = "linux")]
+    shared: Option<([crate::gpu::Texture; 2], usize)>,
+    #[cfg(target_os = "linux")]
+    share: bool,
 }
 
 impl Client {
-    pub(crate) fn open(service: &str, title: &str, width: usize, height: usize) -> Result<Client, String> {
+    pub(crate) fn open(
+        service: &str,
+        title: &str,
+        width: usize,
+        height: usize,
+        resizable: bool,
+    ) -> Result<Client, String> {
         let fail = |e: &dyn std::fmt::Display| format!("Window.create: display `{service}`: {e}");
         let mut looper = Looper::new();
         let conn = looper.connect(service).map_err(|e| fail(&e))?;
@@ -167,6 +192,7 @@ impl Client {
                         key: EVENTS_KEY,
                         interface: EVENTS_INTERFACE.into(),
                     }),
+                    Wire::Bool(resizable),
                 ],
             )
             .map_err(|e| fail(&e))?;
@@ -178,7 +204,113 @@ impl Client {
             input,
             frame: None,
             wheel: (0.0, 0.0),
+            gpu: headless_gpu(),
+            #[cfg(target_os = "linux")]
+            shared: None,
+            #[cfg(target_os = "linux")]
+            share: std::env::var_os("SHINE_SHARE_FRAMES").is_none_or(|v| v != "0"),
         })
+    }
+
+    /// Hand `texture` over without a copy through the CPU: into the next of
+    /// two GPU buffers shared with the server (shared first, and again when
+    /// the size changes), copied there on the GPU, then named to the server
+    /// as the frame to show. Two, so the app draws its next frame into one
+    /// while the server may still be showing the other.
+    #[cfg(target_os = "linux")]
+    fn present_shared(&mut self, texture: &crate::gpu::Texture) -> Result<(), String> {
+        use crate::gpu::{dmabuf, Texture};
+        self.pump();
+        if !self.input.open {
+            return Ok(());
+        }
+        let dev = self.gpu.clone().ok_or("no GPU")?;
+        if dev.egl.as_ref().is_none_or(|egl| !egl.can_export()) {
+            return Err("the driver can't share buffers".into());
+        }
+        let (w, h) = (texture.w, texture.h);
+        let fits = self
+            .shared
+            .as_ref()
+            .is_some_and(|(buffers, _)| (buffers[0].w, buffers[0].h) == (w, h));
+        if !fits {
+            let buffers = [Texture::new(&dev, w, h)?, Texture::new(&dev, w, h)?];
+            let mut args = vec![Wire::Int(self.id), Wire::Int(w as i64), Wire::Int(h as i64)];
+            for buffer in &buffers {
+                let shared = dmabuf::export(&dev, buffer).ok_or("the driver won't share a buffer")?;
+                args.extend([
+                    Wire::Fd(shared.fd),
+                    Wire::Int(i64::from(shared.fourcc)),
+                    Wire::Int(i64::from(shared.stride)),
+                    Wire::Int(i64::from(shared.offset)),
+                    Wire::Int(shared.modifier as i64),
+                ]);
+            }
+            self.call("attachShared", args)?;
+            if crate::gpu::tracing() && self.shared.is_none() {
+                eprintln!("shine: frames go to the display server as GPU buffers, uncopied");
+            }
+            self.shared = Some((buffers, 0));
+        }
+        let (buffers, next) = self.shared.as_mut().expect("made above");
+        let index = *next;
+        *next = 1 - index;
+        buffers[index].copy_from(texture);
+        // Finished before the server is told: its GPU reads what this one
+        // wrote, and nothing else orders the two.
+        // SAFETY: a GL call on this app's current context.
+        unsafe { glow::HasContext::finish(&dev.gl) };
+        self.call("commitShared", vec![Wire::Int(self.id), Wire::Int(index as i64)])
+    }
+
+    /// A call to the server, waiting for its answer; a server that has gone
+    /// is the window closing.
+    fn call(&mut self, method: &str, args: Vec<Wire>) -> Result<(), String> {
+        let Client {
+            looper,
+            conn,
+            input,
+            ..
+        } = self;
+        match looper.call(&mut Events { input: &mut *input }, *conn, ROOT, method, args) {
+            Ok(_) => Ok(()),
+            Err(CallError::Disconnected) => {
+                self.input.open = false;
+                Ok(())
+            }
+            Err(e) => Err(format!("{method}: {e}")),
+        }
+    }
+
+    /// Fill the shared frame (`w` × `h`, attached anew when the size
+    /// changes) with `fill`, then tell the server it's ready.
+    fn send(&mut self, w: usize, h: usize, fill: impl FnOnce(&mut [u8])) -> Result<(), String> {
+        self.pump();
+        if !self.input.open {
+            return Ok(());
+        }
+        if !matches!(&self.frame, Some(f) if f.w == w && f.h == h) {
+            self.attach(w, h)?;
+        }
+        let Some(frame) = self.frame.as_mut() else {
+            return Ok(());
+        };
+        fill(&mut frame.mem.as_mut_slice()[..w * h * 4]);
+        let Client {
+            looper,
+            conn,
+            input,
+            id,
+            ..
+        } = self;
+        match looper.call(&mut Events { input: &mut *input }, *conn, ROOT, "commit", vec![Wire::Int(*id)]) {
+            Ok(_) => Ok(()),
+            Err(CallError::Disconnected) => {
+                self.input.open = false;
+                Ok(())
+            }
+            Err(e) => Err(format!("Graphics.present: {e}")),
+        }
     }
 
     /// One-way call about this window; a server that has gone is the window
@@ -251,35 +383,35 @@ impl Backend for Client {
     }
 
     fn present(&mut self, buf: &[u32], w: usize, h: usize) -> Result<(), String> {
-        self.pump();
-        if !self.input.open {
-            return Ok(());
-        }
-        if !matches!(&self.frame, Some(f) if f.w == w && f.h == h) {
-            self.attach(w, h)?;
-        }
-        let Some(frame) = self.frame.as_mut() else {
-            return Ok(());
-        };
         // Safety: `[u32]` → the bytes of the same memory; the frame is
         // little-endian `0x00RRGGBB`, exactly Shine's own pixel.
         let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w * h * 4) };
-        frame.mem.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        let Client {
-            looper,
-            conn,
-            input,
-            id,
-            ..
-        } = self;
-        match looper.call(&mut Events { input: &mut *input }, *conn, ROOT, "commit", vec![Wire::Int(*id)]) {
-            Ok(_) => Ok(()),
-            Err(CallError::Disconnected) => {
-                self.input.open = false;
-                Ok(())
+        self.send(w, h, |frame| frame.copy_from_slice(bytes))
+    }
+
+    fn gpu_device(&self) -> Option<std::rc::Rc<crate::gpu::Device>> {
+        self.gpu.clone()
+    }
+
+    /// A frame the GPU drew: handed over as a GPU buffer where the server
+    /// and the driver can share one, else read from its texture straight
+    /// into the shared memory, with no stop in the CPU's copy of the screen.
+    fn present_texture(&mut self, texture: &crate::gpu::Texture) -> Result<bool, String> {
+        #[cfg(target_os = "linux")]
+        if self.share {
+            match self.present_shared(texture) {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    if crate::gpu::tracing() {
+                        eprintln!("shine: frames can't be shared ({e}); sending pixels");
+                    }
+                    self.share = false;
+                    self.shared = None;
+                }
             }
-            Err(e) => Err(format!("Graphics.present: {e}")),
         }
+        self.send(texture.w, texture.h, |frame| texture.read_bytes(frame))?;
+        Ok(true)
     }
 
     fn keys_down(&self) -> Vec<Key> {
@@ -364,4 +496,31 @@ impl Drop for Client {
             .looper
             .dispatch(&mut Events { input: &mut self.input }, Some(Duration::ZERO));
     }
+}
+
+/// A GPU to draw on, if drawing on the GPU is wanted and one starts.
+#[cfg(target_os = "linux")]
+fn headless_gpu() -> Option<std::rc::Rc<crate::gpu::Device>> {
+    if !crate::gpu::drawing_wanted() {
+        return None;
+    }
+    match crate::gpu::Device::headless() {
+        Ok(dev) => {
+            if crate::gpu::tracing() {
+                eprintln!("shine: drawing on the GPU: {}", dev.description);
+            }
+            Some(std::rc::Rc::new(dev))
+        }
+        Err(e) => {
+            if crate::gpu::tracing() {
+                eprintln!("shine: no GPU to draw on ({e}); drawing on the CPU");
+            }
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn headless_gpu() -> Option<std::rc::Rc<crate::gpu::Device>> {
+    None
 }

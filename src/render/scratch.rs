@@ -32,4 +32,8 @@ pub struct Scratch {
     pub(crate) glyphs: Vec<(char, f64)>,
     /// Wrapped lines produced by `printf`.
     pub(crate) wrap: WrapBuf,
+    /// A shape's coverage, one byte a pixel, on its way to the GPU.
+    pub(crate) mask: Vec<u8>,
+    /// A run of text laid out: each glyph, and where its mask goes.
+    pub(crate) placed: Vec<(char, crate::geom::Transform)>,
 }

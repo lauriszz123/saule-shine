@@ -15,7 +15,7 @@
 //!
 //! | call | |
 //! |---|---|
-//! | `createWindow(title, w, h, events) -> id` | `events` is the app's object for the calls below |
+//! | `createWindow(title, w, h, events, resizable?) -> id` | `events` is the app's object for the calls below; `resizable` (default true) says whether the app lets the window be resized |
 //! | `attach(id, pixels, w, h)` | shared memory of `w×h` 32-bit pixels, sent once per size |
 //! | `commit(id)` | a new frame is in the pixels; **waited for**: the server has taken it when this returns, so the app may draw the next — which also paces the app to the server |
 //! | `setTitle(id, title)`, `setCursor(id, name)`, `close(id)` | one-way |

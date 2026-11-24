@@ -54,10 +54,20 @@ struct Totals {
     draw: Duration,
     present: Duration,
     idle: Duration,
+    /// Surfaces copied up to the GPU and read back from it (`render::mirror`).
+    uploads: u32,
+    readbacks: u32,
+    /// Batched draws, and the shapes they drew (`gpu::batch`).
+    batches: u32,
+    batched: u32,
 }
 
 const ZERO: Totals = Totals {
     frames: 0,
+    uploads: 0,
+    readbacks: 0,
+    batches: 0,
+    batched: 0,
     draw: Duration::ZERO,
     present: Duration::ZERO,
     idle: Duration::ZERO,
@@ -84,6 +94,36 @@ pub(crate) fn drawing<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// A surface was copied up to the GPU (`up`) or read back from it: the
+/// traffic drawing on the GPU is meant to avoid, reported per frame.
+pub(crate) fn copied(up: bool) {
+    if !enabled() {
+        return;
+    }
+    TOTALS.with(|t| {
+        let mut v = t.get();
+        if up {
+            v.uploads += 1;
+        } else {
+            v.readbacks += 1;
+        }
+        t.set(v);
+    });
+}
+
+/// The GPU drew `shapes` shapes in one draw.
+pub(crate) fn batched(shapes: u32) {
+    if !enabled() {
+        return;
+    }
+    TOTALS.with(|t| {
+        let mut v = t.get();
+        v.batches += 1;
+        v.batched += shapes;
+        t.set(v);
+    });
+}
+
 /// One frame ended: `present` spent putting it on screen, `idle` asleep.
 pub(crate) fn frame(present: Duration, idle: Duration) {
     if !enabled() {
@@ -107,9 +147,25 @@ pub(crate) fn frame(present: Duration, idle: Duration) {
         let frame = span.as_secs_f64() * 1000.0 / n;
         let (draw, present, idle) = (ms(v.draw), ms(v.present), ms(v.idle));
         let program = (frame - draw - present - idle).max(0.0);
+        let mut copies = if v.uploads + v.readbacks > 0 {
+            format!(
+                " · copies up {:.1}, back {:.1}",
+                f64::from(v.uploads) / n,
+                f64::from(v.readbacks) / n
+            )
+        } else {
+            String::new()
+        };
+        if v.batches > 0 {
+            copies.push_str(&format!(
+                " · {:.1} shapes in {:.1} draws",
+                f64::from(v.batched) / n,
+                f64::from(v.batches) / n
+            ));
+        }
         report(&format!(
             "shine {}: {:.0} fps · frame {frame:.1} ms = draw {draw:.1} + present {present:.1} \
-             + program {program:.1} (+ idle {idle:.1})",
+             + program {program:.1} (+ idle {idle:.1}){copies}",
             std::process::id(),
             n / span.as_secs_f64()
         ));

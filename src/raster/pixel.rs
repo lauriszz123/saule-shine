@@ -99,6 +99,14 @@ impl Surface {
                 sb * sa + db - sb * sa * db,
                 sa + da * (1.0 - sa),
             ),
+            // The colour is weighed already (the caller has multiplied in the
+            // paint's alpha): only coverage weighs it further.
+            BlendMode::Premultiplied => (
+                sr * cov + dr * (1.0 - sa),
+                sg * cov + dg * (1.0 - sa),
+                sb * cov + db * (1.0 - sa),
+                sa + da * (1.0 - sa),
+            ),
             // No blending at all: coverage just feathers the overwrite.
             BlendMode::Replace => (
                 dr + (sr - dr) * cov,
@@ -297,6 +305,12 @@ pub enum BlendMode {
     Multiply,
     Screen,
     Replace,
+    /// Alpha blending for an image whose colours are already weighed by
+    /// their alpha — what a canvas holds once anything translucent has been
+    /// drawn onto its transparent start: `s + d·(1 − sa)`, the paint's
+    /// alpha fading the whole image. Images only; shapes and text drawn in
+    /// it blend as with `Alpha`.
+    Premultiplied,
 }
 
 impl BlendMode {
@@ -308,9 +322,11 @@ impl BlendMode {
             "multiply" => Ok(BlendMode::Multiply),
             "screen" => Ok(BlendMode::Screen),
             "replace" | "none" => Ok(BlendMode::Replace),
+            "premultiplied" => Ok(BlendMode::Premultiplied),
             other => Err(format!(
                 "unknown blend mode `{other}` (expected \"alpha\", \"add\", \
-                 \"subtract\", \"multiply\", \"screen\", or \"replace\")"
+                 \"subtract\", \"multiply\", \"screen\", \"replace\" or \
+                 \"premultiplied\")"
             )),
         }
     }
@@ -323,6 +339,7 @@ impl BlendMode {
             BlendMode::Multiply => "multiply",
             BlendMode::Screen => "screen",
             BlendMode::Replace => "replace",
+            BlendMode::Premultiplied => "premultiplied",
         }
     }
 }
@@ -533,6 +550,11 @@ impl Gradient {
             stops: buf,
             count: count as u8,
         })
+    }
+
+    /// The stops, in order: what the GPU's shader is given.
+    pub fn stops(&self) -> &[Stop] {
+        &self.stops[..self.count as usize]
     }
 
     /// The same gradient with `t` mapped through a transform.

@@ -2,7 +2,7 @@
 
 use crate::font::{self, Align, FontRes};
 use crate::geom::Transform;
-use crate::raster::{self, Paint, Surface};
+use crate::raster;
 
 use super::*;
 
@@ -89,42 +89,7 @@ impl Renderer {
 
     /// Draw a single line of text with its top-left corner at `(x, y)`.
     pub fn print(&mut self, text: &str, x: f64, y: f64) -> Result<(), String> {
-        self.ensure_font()?;
-        let paint = self.blit_paint();
-        let xform = self.st.transform;
-
-        let Renderer {
-            screen,
-            screen_dirty,
-            canvases,
-            target,
-            fonts,
-            st,
-            scratch,
-            ..
-        } = self;
-        let surf = surface_of(screen, screen_dirty, canvases, *target);
-        let font = fonts[st.font]
-            .value
-            .as_mut()
-            .expect("ensure_font ran before this call");
-
-        let mut cursor_y = y;
-        for line in text.split('\n') {
-            draw_line(
-                surf,
-                font,
-                &mut scratch.glyphs,
-                line,
-                x,
-                cursor_y,
-                0.0,
-                &xform,
-                &paint,
-            );
-            cursor_y += font.height();
-        }
-        Ok(())
+        self.draw_text(text, x, y, None)
     }
 
     /// Draw wrapped, aligned text inside a `limit`-wide box anchored at
@@ -138,56 +103,102 @@ impl Renderer {
         align: &str,
     ) -> Result<(), String> {
         let align = Align::parse(align)?;
+        self.draw_text(text, x, y, Some((limit, align)))
+    }
+
+    /// `print` (no `wrap`) and `printf`: lay the glyphs out, then draw them
+    /// on the GPU if it can, else on the CPU.
+    fn draw_text(
+        &mut self,
+        text: &str,
+        x: f64,
+        y: f64,
+        wrap: Option<(f64, Align)>,
+    ) -> Result<(), String> {
         self.ensure_font()?;
         let paint = self.blit_paint();
         let xform = self.st.transform;
 
-        let Renderer {
-            screen,
-            screen_dirty,
-            canvases,
-            target,
-            fonts,
-            st,
-            scratch,
-            ..
-        } = self;
-        let surf = surface_of(screen, screen_dirty, canvases, *target);
-        let font = fonts[st.font]
-            .value
-            .as_mut()
-            .expect("ensure_font ran before this call");
-
-        font.wrap_into(text, limit, &mut scratch.wrap);
-
-        let mut cursor_y = y;
-        for line in scratch.wrap.lines() {
-            let width = font.measure_line(&line.text);
-            draw_line(
-                surf,
-                font,
-                &mut scratch.glyphs,
-                &line.text,
-                x + align.offset(width, limit),
-                cursor_y,
-                align.word_spacing(line, width, limit),
-                &xform,
-                &paint,
-            );
-            cursor_y += font.height();
+        let mut placed = std::mem::take(&mut self.scratch.placed);
+        placed.clear();
+        {
+            let Renderer {
+                fonts, st, scratch, ..
+            } = self;
+            let font = fonts[st.font]
+                .value
+                .as_mut()
+                .expect("ensure_font ran before this call");
+            let mut cursor_y = y;
+            match wrap {
+                None => {
+                    for line in text.split('\n') {
+                        place_line(font, &mut scratch.glyphs, line, x, cursor_y, 0.0, &xform, &mut placed);
+                        cursor_y += font.height();
+                    }
+                }
+                Some((limit, align)) => {
+                    font.wrap_into(text, limit, &mut scratch.wrap);
+                    for line in scratch.wrap.lines() {
+                        let width = font.measure_line(&line.text);
+                        place_line(
+                            font,
+                            &mut scratch.glyphs,
+                            &line.text,
+                            x + align.offset(width, limit),
+                            cursor_y,
+                            align.word_spacing(line, width, limit),
+                            &xform,
+                            &mut placed,
+                        );
+                        cursor_y += font.height();
+                    }
+                }
+            }
         }
+
+        if !self.gpu_text(&paint, &placed) {
+            self.touch_cpu(self.which_target());
+            let Renderer {
+                screen,
+                screen_dirty,
+                canvases,
+                target,
+                fonts,
+                st,
+                ..
+            } = self;
+            let surf = surface_of(screen, screen_dirty, canvases, *target);
+            let font = fonts[st.font]
+                .value
+                .as_ref()
+                .expect("ensure_font ran before this call");
+            for (ch, t) in &placed {
+                if let Some(glyph) = font.glyph(*ch) {
+                    raster::blit_mask(surf, &glyph.mask, t, &paint);
+                }
+            }
+        }
+        self.scratch.placed = placed;
         Ok(())
+    }
+
+    /// The font slot and tag of the selected font, as the GPU's glyph atlas
+    /// knows its glyphs: a released font's never pass for a new one's.
+    pub(crate) fn font_key(&self) -> u64 {
+        let i = self.st.font;
+        ((i as u64) << 32) | u64::from(self.fonts[i].tag)
     }
 }
 
-/// Blit one laid-out line. `y` is the line's *top*, matching how Love2D's
-/// `print` anchors text.
+/// Lay one line out, and add each glyph that has pixels, with where its
+/// mask goes on the target, to `placed`. `y` is the line's *top*, matching
+/// how Love2D's `print` anchors text.
 ///
 /// `word_spacing` is extra advance added at each space, which is what turns a
 /// left-aligned line into a justified one.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn draw_line(
-    surf: &mut Surface,
+pub(crate) fn place_line(
     font: &mut FontRes,
     glyphs: &mut Vec<(char, f64)>,
     text: &str,
@@ -195,7 +206,7 @@ pub(crate) fn draw_line(
     y: f64,
     word_spacing: f64,
     xform: &Transform,
-    paint: &Paint,
+    placed: &mut Vec<(char, Transform)>,
 ) {
     if text.is_empty() {
         return;
@@ -229,12 +240,7 @@ pub(crate) fn draw_line(
             continue; // whitespace carries advance but no pixels
         }
         let placement = Transform::translation(x + pen + spread + glyph.left, baseline + glyph.top);
-        raster::blit_mask(
-            surf,
-            &glyph.mask,
-            &snap_to_pixel(xform.then(&placement)),
-            paint,
-        );
+        placed.push((ch, snap_to_pixel(xform.then(&placement))));
     }
 }
 

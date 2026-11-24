@@ -246,10 +246,12 @@ pub fn blit_surface_sub(
             if sa <= 0.0 {
                 continue;
             }
+            // Premultiplied, the paint's alpha fades the colours as well.
+            let k = if paint.blend == BlendMode::Premultiplied { paint.color[3] } else { 1.0 };
             let tint = [
-                sr * paint.color[0],
-                sg * paint.color[1],
-                sb * paint.color[2],
+                sr * paint.color[0] * k,
+                sg * paint.color[1] * k,
+                sb * paint.color[2] * k,
                 sa * paint.color[3],
             ];
             dst.blend(dst_row + px, tint, cover, paint.blend);

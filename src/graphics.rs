@@ -83,6 +83,32 @@ fn graphics_clear(
     Ok(())
 }
 
+/// `Graphics.blur(x, y, w, h, radius, cornerRadius?, opacity?, fade?)` —
+/// blur what is already drawn under the rectangle, as frosted glass shows
+/// what is behind it: a Gaussian blur where pixels up to `radius` away mix
+/// (at most 64 screen pixels). Its corners may be rounded; `opacity` (0–1)
+/// fades the blur in over what is there, and `fade` fades it out over that
+/// many pixels up from the rectangle's bottom (a bar's glass melting into
+/// what is under it). Draw a translucent colour over it after for a tint.
+/// On the GPU where Shine draws on one.
+#[saule_export(class = "Graphics", name = "blur")]
+#[allow(clippy::too_many_arguments)]
+fn graphics_blur(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    radius: f64,
+    corner_radius: Option<f64>,
+    opacity: Option<f64>,
+    fade: Option<f64>,
+) -> Result<(), String> {
+    state::draw(|gfx| {
+        let (corner, opacity, fade) = (corner_radius.unwrap_or(0.0), opacity.unwrap_or(1.0), fade.unwrap_or(0.0));
+        gfx.blur(x, y, w, h, radius, corner, opacity, fade)
+    })?
+}
+
 /// `Graphics.present()` — end a frame: push the framebuffer to the window, pump
 /// events, and apply the 60 FPS frame limit. Call at the bottom of each loop
 /// iteration.
