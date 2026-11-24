@@ -28,6 +28,7 @@ impl MouseState {
     /// Latch this frame's buttons and wheel, given the backend's view right
     /// after `pollEvents` pumped it. Called once per `Window.pollEvents`.
     pub(crate) fn sync(&mut self, buttons: [bool; 3], wheel: (f64, f64)) {
+        let (buttons, wheel) = (crate::pointer::buttons(buttons), crate::pointer::wheel(wheel));
         for (i, &now) in buttons.iter().enumerate() {
             self.pressed[i] = (now && !self.down[i]) || self.carried_pressed[i];
             self.released[i] = (!now && self.down[i]) || self.carried_released[i];
@@ -44,6 +45,7 @@ impl MouseState {
     /// Sample the mouse after presenting, keeping the edges and wheel movement
     /// for the next [`MouseState::sync`].
     pub(crate) fn observe(&mut self, buttons: [bool; 3], wheel: (f64, f64)) {
+        let (buttons, wheel) = (crate::pointer::buttons(buttons), crate::pointer::wheel(wheel));
         for (i, &now) in buttons.iter().enumerate() {
             if now && !self.down[i] {
                 self.carried_pressed[i] = true;

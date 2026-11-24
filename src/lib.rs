@@ -56,6 +56,7 @@ mod keyboard;
 mod mouse;
 mod objects;
 mod particles;
+mod pointer;
 mod protocol;
 mod random;
 mod raster;

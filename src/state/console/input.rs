@@ -273,8 +273,8 @@ impl Input {
         match kind {
             EV_KEY => self.key(device, code, value),
             EV_REL => match code {
-                REL_X => self.move_by(value as f64, 0.0),
-                REL_Y => self.move_by(0.0, value as f64),
+                REL_X => self.move_by(value as f64 * crate::pointer::speed(), 0.0),
+                REL_Y => self.move_by(0.0, value as f64 * crate::pointer::speed()),
                 // Positive is away from the user, as Shine reports it.
                 REL_WHEEL => self.wheel_acc.1 += value as f64,
                 REL_HWHEEL => self.wheel_acc.0 += value as f64,
@@ -326,7 +326,7 @@ impl Input {
                     // The pad's width covers about the screen's width.
                     let sx = bounds.0 / (x.1 - x.0) as f64;
                     let sy = bounds.1 / (y.1 - y.0) as f64;
-                    let s = sx.min(sy);
+                    let s = sx.min(sy) * crate::pointer::speed();
                     self.move_by(dx as f64 * s, dy as f64 * s);
                 }
             }
