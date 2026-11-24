@@ -192,11 +192,41 @@ impl Renderer {
         });
     }
 
-    /// The active clip in device coordinates, defaulting to the whole target.
+    /// The active clip in the current drawing coordinates, defaulting to the
+    /// whole target.
+    ///
+    /// It has to be in the same coordinates `set_scissor` takes, because the
+    /// way to save a clip and put it back is `getScissor` then `setScissor`.
+    /// It used to be in device coordinates, which `set_scissor` then
+    /// transformed a second time: harmless at scale 1, but under uikit's
+    /// Retina `scale(2, 2)` every restored clip landed at twice its place and
+    /// size, so views after a clipped one vanished or slid with the window.
+    ///
+    /// Under a rotation the clip comes back as its bounding box, so a restore
+    /// can grow it; under translate and scale, which is what a UI uses, the
+    /// round trip is exact. A singular transform has no local space, so the
+    /// clip is reported in device coordinates.
     pub fn scissor(&self) -> (f64, f64, f64, f64) {
         let (w, h) = self.target_size();
         let r = self.st.scissor.unwrap_or(Rect::surface(w, h));
-        (r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0)
+        let Some(inverse) = self.st.transform.inverse() else {
+            return (r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+        };
+        let corners = [
+            inverse.apply(r.x0, r.y0),
+            inverse.apply(r.x1, r.y0),
+            inverse.apply(r.x1, r.y1),
+            inverse.apply(r.x0, r.y1),
+        ];
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (px, py) in corners {
+            x0 = x0.min(px);
+            x1 = x1.max(px);
+            y0 = y0.min(py);
+            y1 = y1.max(py);
+        }
+        (x0, y0, x1 - x0, y1 - y0)
     }
 
     /// Restore every default: colour, line settings, blend mode, filter,

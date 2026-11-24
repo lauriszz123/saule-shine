@@ -126,7 +126,8 @@ loads, reporting failure as `nil` instead of raising
   coordinates — `{x1, y1, x2, y2, ...}` — instead of varargs.
 - Scissor rectangles are transformed by the current transform, so clipping
   composes with `translate` the way nested scroll views need. `getScissor`
-  reports screen coordinates.
+  reports the clip in the current drawing coordinates, so `getScissor` then
+  `setScissor` restores it exactly under any translate or scale.
 - `push()` saves the transform; `push("all")` saves the whole state.
 - `newImage(path)` decodes a PNG (via the pure-Rust `png` crate) into the same
   registry canvases live in, so one handle serves both: `draw` composites it,

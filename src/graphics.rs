@@ -383,8 +383,10 @@ fn graphics_intersect_scissor(x: f64, y: f64, w: f64, h: f64) -> Result<(), Stri
     Ok(())
 }
 
-/// `Graphics.getScissor()` — the active clip in *screen* coordinates, or the
-/// full render target when clipping is off.
+/// `Graphics.getScissor()` — the active clip in the current drawing
+/// coordinates, or the full render target when clipping is off. Being in the
+/// same coordinates `setScissor` takes is what lets a view save the clip and
+/// put it back under any scale.
 #[saule_export(class = "Graphics", name = "getScissor")]
 fn graphics_get_scissor() -> Result<(f64, f64, f64, f64), String> {
     state::draw(|gfx| gfx.scissor())

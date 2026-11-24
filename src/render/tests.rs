@@ -138,11 +138,40 @@ fn intersect_scissor_narrows_an_existing_clip() {
 }
 
 #[test]
-fn get_scissor_reports_device_coordinates() {
+fn get_scissor_reports_drawing_coordinates() {
     let mut r = renderer(8, 8);
     r.translate(3.0, 1.0);
     r.set_scissor(Some((0.0, 0.0, 2.0, 2.0)));
-    assert_eq!(r.scissor(), (3.0, 1.0, 2.0, 2.0));
+    assert_eq!(r.scissor(), (0.0, 0.0, 2.0, 2.0));
+}
+
+#[test]
+fn saving_and_restoring_a_scissor_under_a_scale_keeps_it() {
+    // What uikit does round every clipped view, drawing at Retina scale.
+    let mut r = renderer(64, 64);
+    r.scale(2.0, 2.0);
+    r.set_scissor(Some((4.0, 4.0, 10.0, 10.0)));
+
+    let (x, y, w, h) = r.scissor();
+    assert_eq!((x, y, w, h), (4.0, 4.0, 10.0, 10.0));
+    r.intersect_scissor(6.0, 6.0, 2.0, 2.0);
+    r.set_scissor(Some((x, y, w, h)));
+
+    // Device pixels 8..28, not 16..56 as when it was transformed twice.
+    opaque_red(&mut r);
+    r.rectangle("fill", 0.0, 0.0, 32.0, 32.0, 0.0, 0.0)
+        .expect("fill");
+    assert_eq!(r.pixel(7, 8) >> 24, 0);
+    assert_eq!(r.pixel(8, 8), 0xFFFF_0000);
+    assert_eq!(r.pixel(27, 27), 0xFFFF_0000);
+    assert_eq!(r.pixel(28, 28) >> 24, 0);
+}
+
+#[test]
+fn with_clipping_off_get_scissor_is_the_target_in_drawing_coordinates() {
+    let mut r = renderer(64, 32);
+    r.scale(2.0, 2.0);
+    assert_eq!(r.scissor(), (0.0, 0.0, 32.0, 16.0));
 }
 
 #[test]
