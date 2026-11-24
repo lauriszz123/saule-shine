@@ -526,7 +526,9 @@ fn a_rounded_blit_leaves_the_corners_alone() {
         assert_eq!(at(x, y), 0xFFFF_FFFF, "({x}, {y}) should be white");
     }
     // Along the curve, a pixel is partly covered: some grey.
-    let edge = (0..24).map(|x| at(x, 3) & 0xFF).find(|c| *c > 0 && *c < 255);
+    let edge = (0..24)
+        .map(|x| at(x, 3) & 0xFF)
+        .find(|c| *c > 0 && *c < 255);
     assert!(edge.is_some(), "the curve should be antialiased");
 }
 
@@ -546,4 +548,165 @@ fn corner_coverage_is_whole_away_from_the_corners() {
     assert_eq!(corner_coverage(0.5, 10.0, 20.0, 20.0, 6.0), 1.0);
     assert_eq!(corner_coverage(0.5, 0.5, 20.0, 20.0, 6.0), 0.0);
     assert_eq!(corner_coverage(19.5, 19.5, 20.0, 20.0, 6.0), 0.0);
+}
+
+/// What the general blit draws for `sub` of `src` through `xform`: every
+/// destination pixel mapped back and sampled in floating point. The scaled
+/// fast path is checked against it.
+fn reference_blit(dst: &mut Surface, src: &Surface, sub: Rect, xform: &Transform, paint: &Paint) {
+    let (sub_w, sub_h) = (sub.x1 - sub.x0, sub.y1 - sub.y0);
+    let inv = xform.inverse().expect("invertible");
+    let bounds = transformed_bounds(xform, sub_w, sub_h);
+    let (x0, y0, x1, y1) = bounds.intersect(&paint.clip).pixel_bounds(dst.w, dst.h);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let (u, v) = inv.apply(px as f64 + 0.5, py as f64 + 0.5);
+            if u < 0.0 || v < 0.0 || u >= sub_w || v >= sub_h {
+                continue;
+            }
+            let u = sub.x0 + clamp_inside(u, sub_w);
+            let v = sub.y0 + clamp_inside(v, sub_h);
+            let (sa, sr, sg, sb) = if paint.linear_filter {
+                src.sample_linear(u, v)
+            } else {
+                src.sample_nearest(u, v)
+            };
+            if sa <= 0.0 {
+                continue;
+            }
+            let c = paint.color;
+            dst.blend(
+                py * dst.w + px,
+                [sr * c[0], sg * c[1], sb * c[2], sa * c[3]],
+                1.0,
+                BlendMode::Alpha,
+            );
+        }
+    }
+}
+
+/// An image with every kind of pixel a blit meets: opaque, see-through,
+/// fully transparent rows and columns, and sharp edges between them.
+fn busy_image(w: usize, h: usize) -> Surface {
+    let mut s = Surface::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            // A transparent band across the top and down the left, as an
+            // overlay's empty screen around its content.
+            if y < h / 4 || x < w / 5 {
+                continue;
+            }
+            let a = if (x + y) % 3 == 0 {
+                255
+            } else {
+                (37 * x + 11 * y) as u32 % 256
+            };
+            let r = (13 * x) as u32 % 256;
+            let g = (7 * y) as u32 % 256;
+            let b = (x * y) as u32 % 256;
+            s.buf[y * w + x] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+    s
+}
+
+/// The largest difference in any channel of any pixel.
+fn largest_difference(a: &Surface, b: &Surface) -> u32 {
+    let channel = |p: u32, shift: u32| (p >> shift) & 0xFF;
+    a.buf
+        .iter()
+        .zip(&b.buf)
+        .map(|(&p, &q)| {
+            [0, 8, 16, 24]
+                .iter()
+                .map(|&s| channel(p, s).abs_diff(channel(q, s)))
+                .max()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_scaled_blit_draws_what_the_general_one_does() {
+    let src = busy_image(40, 30);
+    let whole = Rect::new(0.0, 0.0, 40.0, 30.0);
+    // One frame of a sheet: x 8 to 30, y 6 to 25.
+    let corner = Rect::new(8.0, 6.0, 22.0, 19.0);
+    let backdrop = 0xFF30_5070;
+
+    let transforms = [
+        (
+            "grown into place",
+            Transform::translation(7.3, 4.6).then(&Transform::scaling(0.96, 0.96)),
+        ),
+        (
+            "twice the size",
+            Transform::translation(3.0, 2.0).then(&Transform::scaling(2.0, 2.0)),
+        ),
+        (
+            "half the size",
+            Transform::translation(10.0, 9.0).then(&Transform::scaling(0.5, 0.5)),
+        ),
+        (
+            "stretched",
+            Transform::translation(-4.5, 1.25).then(&Transform::scaling(1.7, 0.8)),
+        ),
+        (
+            "flipped",
+            Transform::translation(60.0, 70.0).then(&Transform::scaling(-1.3, -1.1)),
+        ),
+        ("moved part of a pixel", Transform::translation(5.5, 3.25)),
+    ];
+    let tints = [
+        ("as it is", [1.0, 1.0, 1.0, 1.0]),
+        ("faded", [1.0, 1.0, 1.0, 0.37]),
+        ("tinted", [0.8, 0.5, 0.2, 0.9]),
+    ];
+
+    for (what, xform) in &transforms {
+        for (how, color) in &tints {
+            for linear in [true, false] {
+                for sub in [whole, corner] {
+                    let mut p = paint(*color, 80, 80);
+                    p.linear_filter = linear;
+                    p.clip = Rect::new(2.0, 3.0, 75.0, 71.0);
+
+                    let mut fast = Surface {
+                        buf: vec![backdrop; 80 * 80],
+                        w: 80,
+                        h: 80,
+                    };
+                    let mut slow = fast.clone();
+                    blit_surface_sub(&mut fast, &src, sub, xform, &p);
+                    reference_blit(&mut slow, &src, sub, xform, &p);
+
+                    let off = largest_difference(&fast, &slow);
+                    assert!(
+                        off <= 1,
+                        "{what}, {how}, linear {linear}, {sub:?}: off by {off}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A transform with any rotation in it is not the scaled path's to draw.
+#[test]
+fn a_rotated_blit_is_left_to_the_general_path() {
+    let src = busy_image(10, 10);
+    let mut dst = Surface::new(30, 30);
+    let p = paint([1.0; 4], 30, 30);
+    let turned = Transform::translation(15.0, 15.0).then(&Transform::rotation(0.3));
+    let clip = p.clip;
+    assert!(!blit_scaled(
+        &mut dst,
+        &src,
+        Rect::new(0.0, 0.0, 10.0, 10.0),
+        &turned,
+        &p,
+        clip
+    ));
+    assert!(dst.buf.iter().all(|&px| px == 0), "it drew nothing");
 }

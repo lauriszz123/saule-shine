@@ -123,6 +123,8 @@ pub fn blit_surface_sub(
         // as-is — and it skips the channel-wise modulate entirely, so the
         // branch is hoisted out of the row rather than tested per pixel.
         let plain = tint.is_opaque_white();
+        // Faded, not coloured: how an overlay comes and goes.
+        let fade = tint.r == 255 && tint.g == 255 && tint.b == 255;
         let radius = paint.corner_radius.min(sub_w / 2.0).min(sub_h / 2.0);
 
         for py in y0..y1 {
@@ -178,6 +180,17 @@ pub fn blit_surface_sub(
                         lerp_argb(s | 0xFF00_0000, dst.buf[dst_base + k], sa)
                     };
                 }
+            } else if fade {
+                // The layer at a fraction of its strength, its colours as
+                // they are: one weight to work out and one blend.
+                for k in 0..x1 - x0 {
+                    let s = src.buf[src_base + k];
+                    let a = div255((s >> 24) * tint.a);
+                    if a == 0 {
+                        continue;
+                    }
+                    dst.buf[dst_base + k] = lerp_argb(s | 0xFF00_0000, dst.buf[dst_base + k], a);
+                }
             } else {
                 for k in 0..x1 - x0 {
                     let s = src.buf[src_base + k];
@@ -188,6 +201,12 @@ pub fn blit_surface_sub(
                 }
             }
         }
+        return;
+    }
+
+    // Scaled or flipped but square to the screen: worked out per row and
+    // column rather than per pixel (see `blit_scaled`).
+    if blit_scaled(dst, src, sub, xform, paint, clip) {
         return;
     }
 
