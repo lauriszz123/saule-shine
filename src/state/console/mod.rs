@@ -78,6 +78,20 @@ impl Console {
         // frames is drawn by the CPU, into the CPU's copy.
         if console.hardware_cursor {
             match gpu::ConsoleGpu::new(&console.display) {
+                // OpenGL with no GPU behind it: the CPU draws faster by
+                // Shine's own code than by Mesa's.
+                Ok(gpu)
+                    if !crate::gpu::drawing_forced()
+                        && gpu
+                            .device()
+                            .is_some_and(|dev| crate::gpu::software_renderer(&dev.description)) =>
+                {
+                    if crate::gpu::tracing() {
+                        eprintln!(
+                            "shine: no GPU, only Mesa on the CPU; drawing on the CPU with Shine's own code"
+                        );
+                    }
+                }
                 Ok(gpu) => {
                     if crate::gpu::tracing() {
                         if let Some(dev) = gpu.device() {

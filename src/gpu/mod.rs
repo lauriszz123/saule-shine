@@ -58,9 +58,25 @@ use crate::raster::{BlendMode, Gradient, GradientKind};
 /// image edits, which the CPU does on its copy (see `docs/gpu.md`).
 pub(crate) fn drawing_wanted() -> bool {
     static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *WANTED.get_or_init(|| {
-        wanted() && std::env::var_os("SHINE_GPU_DRAW").is_none_or(|v| v != "0")
-    })
+    *WANTED.get_or_init(|| wanted() && std::env::var_os("SHINE_GPU_DRAW").is_none_or(|v| v != "0"))
+}
+
+/// Whether drawing on the GPU was asked for outright (`SHINE_GPU_DRAW=1`),
+/// whatever the GPU turns out to be.
+pub(crate) fn drawing_forced() -> bool {
+    std::env::var_os("SHINE_GPU_DRAW").is_some_and(|v| v == "1")
+}
+
+/// Whether the OpenGL a device described as `description` gives is Mesa
+/// drawing on the CPU (softpipe, llvmpipe), which is what a machine gets
+/// whose chip has no driver. It runs every shader a pixel at a time and is
+/// far slower than Shine's own CPU drawing: a blur across the screen takes
+/// seconds, not milliseconds.
+pub(crate) fn software_renderer(description: &str) -> bool {
+    let name = description.to_ascii_lowercase();
+    ["softpipe", "llvmpipe", "swrast", "software rasterizer"]
+        .iter()
+        .any(|software| name.contains(software))
 }
 
 /// A pixel rectangle `x0..x1` × `y0..y1` of a target, rows counted from the
@@ -655,4 +671,27 @@ pub(crate) fn wanted() -> bool {
 /// Whether to say which way frames are presented.
 pub(crate) fn tracing() -> bool {
     std::env::var_os("SHINE_TRACE_PRESENT").is_some()
+}
+
+#[cfg(test)]
+mod software_tests {
+    use super::software_renderer;
+
+    #[test]
+    fn mesa_on_the_cpu_is_told_from_a_gpu() {
+        for description in [
+            "OpenGL ES 3.1 Mesa 26.0.8 · softpipe",
+            "OpenGL ES 3.2 Mesa 25.2.1 · llvmpipe (LLVM 20.1.2, 256 bits)",
+            "2.1 Mesa 10.5.4 · Software Rasterizer",
+        ] {
+            assert!(software_renderer(description), "{description}");
+        }
+        for description in [
+            "OpenGL ES 2.0 Mesa 26.0.8 · i915 (chipset: Pineview M)",
+            "OpenGL ES 3.2 Mesa 26.0.8 · virgl (AMD Radeon RX 6700 XT)",
+            "4.6 Mesa 25.0 · D3D12 (AMD Radeon RX 6700 XT)",
+        ] {
+            assert!(!software_renderer(description), "{description}");
+        }
+    }
 }

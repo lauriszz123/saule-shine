@@ -60,7 +60,10 @@ Two halves, deliberately:
   where it hasn't. Drawing moves onto the GPU step by step:
   [docs/gpu.md](docs/gpu.md) has the plan. `SHINE_GPU=0` turns it off,
   `SHINE_TRACE_PRESENT=1` says which way frames go, `SHINE_GPU_DRAW=0`
-  keeps drawing on the CPU while still presenting through the GPU, and
+  keeps drawing on the CPU while still presenting through the GPU
+  (`SHINE_GPU_DRAW=1` draws through OpenGL even where it is only Mesa on
+  the CPU, which on the bare screen Shine otherwise passes over for its
+  own, faster drawing), and
   `SHINE_TRACE_FRAMES=1` reports, with the frame times, how many surfaces
   were copied between the CPU and the GPU.
 
