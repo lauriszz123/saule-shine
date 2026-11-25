@@ -631,6 +631,15 @@ fn compositor_configure(id: i64, width: i64, height: i64) -> Result<(), String> 
     tell(id, "configure", vec![Wire::Int(width), Wire::Int(height)])
 }
 
+/// `Compositor.sendScale(id, scale)` — the scale the window is to draw
+/// at: the server's own (`Window.getScale()`), so that a window is as
+/// large and as sharp as what is around it. The window's size
+/// (`configure`) and the pointer's position are in pixels all the same.
+#[saule_export(class = "Compositor", name = "sendScale")]
+fn compositor_send_scale(id: i64, scale: f64) -> Result<(), String> {
+    tell(id, "scale", vec![Wire::Float(scale)])
+}
+
 /// `Compositor.sendKey(id, key, down, shift, ctrl, alt)` — a key pressed or
 /// released, by Shine's key name, to the window's app.
 #[saule_export(class = "Compositor", name = "sendKey")]

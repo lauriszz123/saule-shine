@@ -281,6 +281,17 @@ is all a game loop reading held keys needs.
 
 **Density** — `getScale()`
 
+### Scale
+
+`Window.getScale()` is how many pixels a point of the UI is: a UI lays
+itself out in points and multiplies. On a desktop it is the desktop's. On
+the bare screen it is what suits the screen (1 below 1000 lines, 1.25 at a
+laptop's 1080, 1.5 from 1300, 2 from 2000), or what `Window.setScale(s)`
+or `SHINE_SCALE` says; `setScale(0)` goes back to what suits. A window
+under a Shine window manager draws at the manager's scale, which the
+manager tells it (`Compositor.sendScale`), and starts at it through
+`SHINE_SCALE` in its environment.
+
 ### Closing
 
 A window closes when it is asked to, and the loop sees `closed`. A program

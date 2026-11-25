@@ -156,7 +156,7 @@ impl Backend for Console {
     }
 
     fn scale(&self) -> f64 {
-        1.0
+        crate::window::screen_scale(self.display.size().1)
     }
 
     fn backing_scale(&self) -> f64 {

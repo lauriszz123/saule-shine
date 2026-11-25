@@ -30,6 +30,10 @@ use crate::protocol::{BYTES_PER_PIXEL, EVENTS_INTERFACE, EVENTS_KEY};
 struct Input {
     size: (usize, usize),
     open: bool,
+    /// The scale the server draws at, which this window is drawn at too:
+    /// what the server last said, or what the environment said at the
+    /// start (`SHINE_SCALE`, which a server sets for what it starts).
+    scale: f64,
     /// Asked to close while the program holds closing: for the next poll.
     close_asked: bool,
     focused: bool,
@@ -107,6 +111,11 @@ impl Handler for Events<'_> {
             ("pointer", [x, y]) => {
                 if let (Some(x), Some(y)) = (float(x), float(y)) {
                     input.pointer = Some((x, y));
+                }
+            }
+            ("scale", [scale]) => {
+                if let Some(scale) = float(scale).filter(|s| s.is_finite() && *s > 0.0) {
+                    input.scale = scale.clamp(0.5, 4.0);
                 }
             }
             ("leave", []) => input.pointer = None,
@@ -203,6 +212,14 @@ impl Client {
         let mut input = Input {
             size: (width, height),
             open: true,
+            scale: {
+                let chosen = crate::window::chosen_scale();
+                if chosen > 0.0 {
+                    chosen
+                } else {
+                    1.0
+                }
+            },
             close_asked: false,
             focused: true,
             ..Input::default()
@@ -441,7 +458,7 @@ impl Backend for Client {
     }
 
     fn scale(&self) -> f64 {
-        1.0
+        self.input.scale
     }
 
     fn backing_scale(&self) -> f64 {

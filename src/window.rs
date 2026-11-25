@@ -107,6 +107,62 @@ fn window_poll_events() -> Result<saule_sdk::types::STable, String> {
     })?
 }
 
+/// The size of everything, as the person chose it: 0 for "as suits the
+/// screen". Bits of an `f64`, so it can be read from anywhere.
+static UI_SCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UI_SCALE_READ: std::sync::Once = std::sync::Once::new();
+
+/// The scale chosen, or 0 for none: `Window.setScale`, and before that
+/// the environment's `SHINE_SCALE`.
+pub(crate) fn chosen_scale() -> f64 {
+    UI_SCALE_READ.call_once(|| {
+        let from_environment = std::env::var("SHINE_SCALE")
+            .ok()
+            .and_then(|text| text.trim().parse::<f64>().ok())
+            .filter(|scale| scale.is_finite() && *scale > 0.0);
+        if let Some(scale) = from_environment {
+            UI_SCALE.store(scale.clamp(0.5, 4.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    f64::from_bits(UI_SCALE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The scale a screen `height` pixels high is drawn at on the bare
+/// screen: the one chosen, or one that suits it. Nothing says how large
+/// the screen is, only how many pixels it has, so this goes by those: a
+/// laptop's 1080 lines want everything a quarter larger than a netbook's
+/// 600, and a 4K screen twice.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn screen_scale(height: usize) -> f64 {
+    let chosen = chosen_scale();
+    if chosen > 0.0 {
+        return chosen;
+    }
+    match height {
+        0..=999 => 1.0,
+        1000..=1299 => 1.25,
+        1300..=1999 => 1.5,
+        _ => 2.0,
+    }
+}
+
+/// `Window.setScale(scale)` — draw everything `scale` times its size on
+/// the bare screen: 1 a pixel to a point, 1.5 half as large again. 0 is
+/// "as suits the screen", which is how it starts. `Window.getScale()`
+/// answers with it from the next frame, and a UI that sizes itself by
+/// that follows. In a window on another desktop that desktop's scale
+/// stands, and this does nothing.
+#[saule_export(class = "Window", name = "setScale")]
+fn window_set_scale(scale: f64) {
+    let _ = chosen_scale();
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale.clamp(0.5, 4.0)
+    } else {
+        0.0
+    };
+    UI_SCALE.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether the program decides for itself when its window closes.
 static CLOSE_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

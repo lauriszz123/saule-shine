@@ -27,6 +27,7 @@
 //! | `configure(w, h)` | the window's size from now on — in a tiling layout the server decides it |
 //! | `key(name, down, shift, ctrl, alt)` | a key, by Shine's key name |
 //! | `text(text)` | typed text, already through the server's keyboard layout |
+//! | `scale(scale)` | the scale the server draws at, for the window to draw at too |
 //! | `pointer(x, y)`, `leave()` | the pointer over the window, in its own coordinates; or gone from it |
 //! | `button(button, down)`, `wheel(dx, dy)` | mouse buttons (1 left, 2 right, 3 middle) and the wheel |
 //! | `focus(focused)`, `close()` | keyboard focus; the user asked to close the window |
