@@ -484,9 +484,24 @@ pub(crate) enum KeyMessage {
         key: Key,
         mods: Modifiers,
     },
+    /// A key the window library has no [`Key`] for, by Shine's name for
+    /// it: the volume and brightness keys, the power button. Events only:
+    /// `Keyboard.isDown` doesn't know them.
+    Named {
+        name: &'static str,
+        down: bool,
+        mods: Modifiers,
+    },
     /// A run of typed characters. Consecutive characters coalesce into one
     /// message, so a fast typist costs one event rather than one per letter.
     Text(String),
+}
+
+/// A key with a name but no [`Key`] went down or came up.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn push_named(name: &'static str, down: bool) {
+    let mods = EDGES.with(|cell| current_mods(&cell.borrow()));
+    push_message(KeyMessage::Named { name, down, mods });
 }
 
 #[derive(Clone, Copy, Default)]
@@ -765,6 +780,10 @@ mod tests {
                 KeyMessage::Up { key, mods } => {
                     format!("up:{}{}", key_name(key).unwrap_or("?"), mod_suffix(mods))
                 }
+                KeyMessage::Named { name, down, mods } => {
+                    let edge = if down { "down" } else { "up" };
+                    format!("{edge}:{name}{}", mod_suffix(mods))
+                }
                 KeyMessage::Text(t) => format!("text:{t}"),
             })
             .collect()
@@ -816,6 +835,28 @@ mod tests {
         assert_eq!(
             log_summary(),
             vec!["down:a", "text:a", "up:a", "down:a", "text:a", "up:a"]
+        );
+    }
+
+    /// The volume keys and their like have no `Key`: they are messages by
+    /// name, with the modifiers held.
+    #[test]
+    fn a_key_with_only_a_name_is_a_message_too() {
+        reset_input();
+
+        TextCollector.set_key_state(Key::LeftShift, true);
+        push_named("volumeup", true);
+        push_named("volumeup", false);
+        TextCollector.set_key_state(Key::LeftShift, false);
+
+        assert_eq!(
+            log_summary(),
+            vec![
+                "down:lshift+shift",
+                "down:volumeup+shift",
+                "up:volumeup+shift",
+                "up:lshift"
+            ]
         );
     }
 

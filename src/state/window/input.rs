@@ -131,6 +131,9 @@ impl Engine {
         // Delivered once, on the transition. Re-reporting it every poll made
         // any handler that was not idempotent fire for as long as the loop
         // took to notice.
+        if self.backend.take_close_asked() {
+            self.events.push(Event::CloseRequested);
+        }
         if !self.is_open() && !self.close_reported {
             self.close_reported = true;
             self.events.push(Event::Closed);
@@ -223,6 +226,21 @@ impl Engine {
                         alt: mods.alt,
                     })
                 }
+                keyboard::KeyMessage::Named { name, down, mods } => Some(if down {
+                    Event::KeyPressed {
+                        key: name,
+                        shift: mods.shift,
+                        ctrl: mods.ctrl,
+                        alt: mods.alt,
+                    }
+                } else {
+                    Event::KeyReleased {
+                        key: name,
+                        shift: mods.shift,
+                        ctrl: mods.ctrl,
+                        alt: mods.alt,
+                    }
+                }),
                 keyboard::KeyMessage::Text(text) => Some(Event::TextInput(text)),
             };
 

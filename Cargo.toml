@@ -91,6 +91,7 @@ libloading = "0.8"
 # buffers when there is no X11 or Wayland session — Saule Linux's bare
 # screen. Pure Rust (rustix ioctls), so it needs no libdrm.
 drm = "0.14"
+xkbcommon-dl = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # Per-monitor DPI awareness, and the scale factor for the window. minifb has no

@@ -24,6 +24,14 @@ pub(crate) trait Backend {
     /// `false` once the window has been closed.
     fn is_open(&self) -> bool;
 
+    /// Whether the window was asked to close since this was last asked,
+    /// while the program holds closing for itself to decide
+    /// (`Window.holdClose`). Only a backend that can leave the window open
+    /// says so; on the others the window has already closed.
+    fn take_close_asked(&mut self) -> bool {
+        false
+    }
+
     /// The drawable size in the units pointer positions are reported in.
     /// Multiply by [`Backend::backing_scale`] for framebuffer pixels.
     fn size(&self) -> (usize, usize);

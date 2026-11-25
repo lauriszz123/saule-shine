@@ -55,6 +55,9 @@ pub enum EventKind {
     FocusChanged,
     /// The user asked to close the window. Love2D's `quit`.
     Quit,
+    /// The window was asked to close and the program holds closing for
+    /// itself (`Window.holdClose`): it is still open.
+    CloseRequested,
 }
 
 /// One thing that happened since the last poll. Fields that do not apply to
@@ -171,6 +174,7 @@ impl Event {
                 ..Event::blank(EventKind::FocusChanged)
             },
             Raw::Closed => Event::blank(EventKind::Quit),
+            Raw::CloseRequested => Event::blank(EventKind::CloseRequested),
         }
     }
 }

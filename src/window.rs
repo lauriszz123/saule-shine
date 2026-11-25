@@ -107,6 +107,24 @@ fn window_poll_events() -> Result<saule_sdk::types::STable, String> {
     })?
 }
 
+/// Whether the program decides for itself when its window closes.
+static CLOSE_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn close_held() -> bool {
+    CLOSE_HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `Window.holdClose(on)` — leave closing the window to the program. A
+/// request to close it (the window manager's close button) then arrives
+/// as a `closeRequested` event with the window still open, and the
+/// program closes it with `Window.close()` when it is ready: after asking
+/// about what was not saved. Under a window manager of Shine's own; a
+/// window on another desktop closes as that desktop has it.
+#[saule_export(class = "Window", name = "holdClose")]
+fn window_hold_close(on: bool) {
+    CLOSE_HELD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `Window.close()` — close the window and end the loop.
 #[saule_export(class = "Window", name = "close")]
 fn window_close() {

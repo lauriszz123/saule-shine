@@ -36,8 +36,9 @@ functions annotated with `#[saule_export]`, and the package is declared with
 |------------|-----------------------------------------------------------|
 | `Window`   | lifecycle, live size, title, position, focus, DPI — see below |
 | `Graphics` | the UI drawing surface — see below                        |
-| `Keyboard` | key state, per-frame edges, typed text — see below        |
-| `Mouse`    | position, buttons, per-frame edges, wheel, cursor — see below |
+| `Keyboard` | key state, per-frame edges, typed text, layouts — see below |
+| `Mouse`    | position, buttons, per-frame edges, wheel, cursor, feel — see below |
+| `Devices`  | `list`: the input devices of the machine — see below      |
 | `Timer`    | `getTime`, `getDelta`, `getFPS`, `sleep`                   |
 | `Clipboard`| `get`, `set`, `hasText`                                   |
 
@@ -280,6 +281,15 @@ is all a game loop reading held keys needs.
 
 **Density** — `getScale()`
 
+### Closing
+
+A window closes when it is asked to, and the loop sees `closed`. A program
+with something to ask first (unsaved changes) calls `Window.holdClose(true)`:
+the request then arrives as a `closeRequested` event with the window still
+open, and the program calls `Window.close()` when it is ready. This is
+under a window manager of Shine's own; a window on another desktop closes
+as that desktop has it.
+
 ### Escape does not quit
 
 Love2D ends the loop when Escape is held. This engine does not, unless you ask
@@ -347,6 +357,20 @@ the state a queue cannot answer.
 `"resizeupdown"`, `"resizeall"`; an unknown name is an error rather than a
 silent no-op.
 
+**A trackpad's own feel** — `setTouchpadSpeed(speed)`,
+`setTouchpadScrollSpeed(speed)`, `setTouchpadNaturalScrolling(on)`,
+`setTapToClick(on)`: beside `setPointerSpeed` and the rest, which are a
+mouse's. They take effect on the bare screen, where Shine reads the
+trackpad itself; in a window the desktop around has already made of the
+fingers what it makes.
+
+**`Devices.list()`** — what the machine is typed on and pointed at with,
+each as `"kind<TAB>where<TAB>name"`: kind is `keyboard`, `mouse`,
+`touchpad`, `touchscreen` or `tablet` (a pointer that says where it is,
+not how far it moved); where is `built-in` or `connected`. It follows
+devices being plugged in and taken out. On the bare screen only; in a
+window the list is empty, and the desktop around has the devices.
+
 Input is sampled after *both* of minifb's message pumps — `update` in
 `pollEvents` and the one inside `update_with_buffer` in `present` — and the
 extra edges are carried into the next frame. Each pump begins by resetting
@@ -381,6 +405,24 @@ in the queue, and what remains on `Keyboard` is the level half.
 `TextInput` events are produced; disabling it mid-frame also drops text already
 typed this frame, so a handler never sees input the app has just declined.
 
+**Layouts** — `setLayout(layout, variant)`, `getLayout()`, `layouts()`. On
+the bare screen the kernel reports which key was pressed, not what is
+printed on it; what it types is a layout's to say. The layouts are XKB's
+(`"lt"`, `"de"`, `"us"`; `variant` `""` for the usual one), read by
+libxkbcommon, which is looked for when a layout is asked for and not
+linked: without it, or without XKB's descriptions, `setLayout` returns
+false and the keyboard types as a US one. `layouts()` lists what there is
+to choose from, each `"code<TAB>Name"`. `XKB_DEFAULT_LAYOUT` chooses one
+before the program asks. Dead keys compose (`´` then `e` is `é`), AltGr
+picks a key's third character and is then not reported as Alt, and key
+*names* stay the key's position, so a shortcut is the same keys in every
+layout. In a window the desktop's own layout types and these do nothing.
+
+**Losing the keyboard.** Under a window manager of Shine's own, a window
+told it no longer has the keyboard lets go of every key it held: the news
+of their release goes elsewhere from then on, and a key never released is
+a shortcut's modifier held for good.
+
 Key names are Love2D's `KeyConstant` strings — `"a"`, `"space"`, `"lshift"`,
 `"return"`, `"kp0"`, `"/"` — so code reads the same as its Love2D equivalent.
 Unrecognised names report as "not down" rather than erroring. See
@@ -400,6 +442,11 @@ on the whole surface.
 - `setKeyRepeat(true)` makes a held key keep emitting `KeyPressed` after a
   0.25 s delay, then every 0.05 s. Repeats are synthesised by the engine, so
   they land after the frame's real messages.
+- On the bare screen the keys with pictures on them are events too, under
+  these names: `volumeup`, `volumedown`, `mute`, `brightnessup`,
+  `brightnessdown`, `kbdillumup`, `kbdillumdown`, `micmute`, `audioplay`,
+  `audionext`, `audioprev`, `printscreen`, `sleep`, `power`. They repeat
+  while held, as the kernel repeats them, and `isDown` does not know them.
 - **Not implemented**: scancodes (`isScancodeDown`, `getScancodeFromKey`,
   `getKeyFromScancode`). The windowing backend reports keys already mapped
   through the OS layout, so there is no honest physical-position code to hand

@@ -30,6 +30,8 @@ use crate::protocol::{BYTES_PER_PIXEL, EVENTS_INTERFACE, EVENTS_KEY};
 struct Input {
     size: (usize, usize),
     open: bool,
+    /// Asked to close while the program holds closing: for the next poll.
+    close_asked: bool,
     focused: bool,
     pointer: Option<(f64, f64)>,
     buttons: [bool; 3],
@@ -119,8 +121,30 @@ impl Handler for Events<'_> {
                 input.wheel.0 += float(dx).unwrap_or(0.0);
                 input.wheel.1 += float(dy).unwrap_or(0.0);
             }
-            ("focus", [focused]) => input.focused = boolean(focused),
-            ("close", []) => input.open = false,
+            ("focus", [focused]) => {
+                input.focused = boolean(focused);
+                // The keyboard has gone elsewhere, and so will the news of
+                // every key let go of from now: all of them are let go of
+                // here. Without this a shortcut that takes the keyboard
+                // away (the window manager's own, held with Ctrl) leaves
+                // Ctrl held for good as far as this program can tell, and
+                // the next letters typed are shortcuts.
+                if !input.focused {
+                    for key in std::mem::take(&mut input.held) {
+                        TextCollector.set_key_state(key, false);
+                    }
+                }
+            }
+            // Asked to close: closed at once, unless the program has said
+            // it decides that itself (`Window.holdClose`), which is then
+            // told and left open.
+            ("close", []) => {
+                if crate::window::close_held() {
+                    input.close_asked = true;
+                } else {
+                    input.open = false;
+                }
+            }
             // A newer server's call this build does not know: ignored, so
             // the two can be updated one at a time.
             _ => {}
@@ -179,6 +203,7 @@ impl Client {
         let mut input = Input {
             size: (width, height),
             open: true,
+            close_asked: false,
             focused: true,
             ..Input::default()
         };
@@ -405,6 +430,10 @@ impl Client {
 impl Backend for Client {
     fn is_open(&self) -> bool {
         self.input.open
+    }
+
+    fn take_close_asked(&mut self) -> bool {
+        std::mem::take(&mut self.input.close_asked)
     }
 
     fn size(&self) -> (usize, usize) {

@@ -125,6 +125,30 @@ pub(super) fn key(code: u16) -> Option<Key> {
     })
 }
 
+/// Shine's name for a key the window library has none for: the keys of a
+/// laptop's top row, and the buttons on its case. They are events only
+/// (`keyPressed` with this name), repeating while held as the kernel
+/// repeats them.
+pub(super) fn named(code: u16) -> Option<&'static str> {
+    Some(match code {
+        99 => "printscreen",
+        113 => "mute",
+        114 => "volumedown",
+        115 => "volumeup",
+        116 => "power",
+        142 => "sleep",
+        163 => "audionext",
+        164 => "audioplay",
+        165 => "audioprev",
+        224 => "brightnessdown",
+        225 => "brightnessup",
+        229 => "kbdillumdown",
+        230 => "kbdillumup",
+        248 => "micmute",
+        _ => return None,
+    })
+}
+
 /// The character a key types on a US keyboard, or `None` for keys that type
 /// nothing (arrows, modifiers, Enter, …: those are key events, not text).
 ///

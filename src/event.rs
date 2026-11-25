@@ -89,6 +89,10 @@ pub enum Event {
     /// The user asked to close the window. `Window.isOpen()` is already false
     /// by the time this is seen.
     Closed,
+    /// The window was asked to close while the program holds closing for
+    /// itself (`Window.holdClose`): it is still open, and the program's
+    /// to close.
+    CloseRequested,
 }
 
 impl Event {
@@ -108,6 +112,7 @@ impl Event {
             Event::Resized { .. } => "resized",
             Event::FocusChanged(_) => "focusChanged",
             Event::Closed => "closed",
+            Event::CloseRequested => "closeRequested",
         }
     }
 
@@ -170,7 +175,7 @@ impl Event {
             Event::FocusChanged(focused) => {
                 out.push(SValue::from(*focused))?;
             }
-            Event::Closed => {}
+            Event::Closed | Event::CloseRequested => {}
         }
 
         Ok(out)

@@ -33,7 +33,9 @@ use minifb::{InputCallback, Key};
 
 use super::keymap;
 use super::touchpad::{self, Moves, Touch};
+use crate::devices::{self, Found, Kind};
 use crate::keyboard::TextCollector;
+use crate::layout::{self, Typed};
 
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
@@ -46,6 +48,10 @@ const REL_WHEEL: u16 = 0x08;
 
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
+
+const KEY_ENTER: u16 = 28;
+const KEY_A: u16 = 30;
+const KEY_Z: u16 = 44;
 
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
@@ -83,6 +89,20 @@ fn eviocgbit(ev: u16, len: usize) -> c_ulong {
 }
 
 /// `EVIOCGABS(axis)`: an absolute axis's range.
+/// `EVIOCGNAME(len)`: the device's name for itself.
+fn eviocgname(len: usize) -> c_ulong {
+    (2 << 30) | ((len as c_ulong) << 16) | ((b'E' as c_ulong) << 8) | 0x06
+}
+
+/// `EVIOCGID`: a `struct input_id`, four 16-bit numbers, the first of them
+/// the bus the device is on.
+const EVIOCGID: c_ulong = (2 << 30) | (8 << 16) | ((b'E' as c_ulong) << 8) | 0x02;
+
+/// The buses a device that is part of the machine is on: the keyboard
+/// controller, I2C and SPI (a laptop's touchpad), and the machine itself.
+/// What is plugged in comes by USB or Bluetooth.
+const BUILT_IN_BUSES: [u16; 5] = [0x10, 0x11, 0x18, 0x19, 0x1c];
+
 fn eviocgabs(axis: u16) -> c_ulong {
     (2 << 30) | (24 << 16) | (0x45 << 8) | (0x40 + axis as c_ulong)
 }
@@ -112,6 +132,9 @@ struct Device {
     path: PathBuf,
     file: File,
     pointer: Pointer,
+    /// What it is, for [`crate::devices`]: `None` for the buttons on the
+    /// case, the lid and the like, which nothing is set on.
+    found: Option<Found>,
     /// Touchpads: where the finger was at the last event while touching.
     finger: Option<(i32, i32)>,
     /// The absolute position this frame's events are building up.
@@ -134,11 +157,17 @@ impl Device {
 
         let mut abs_bits = [0u8; 8];
         let mut key_bits = [0u8; 96];
+        let mut rel_bits = [0u8; 2];
+        let mut name = [0u8; 128];
+        let mut id = [0u16; 4];
         // Safety: each request writes at most the length encoded in it into
         // the array passed, which is that long.
         unsafe {
             libc::ioctl(fd, eviocgbit(EV_ABS, abs_bits.len()), abs_bits.as_mut_ptr());
             libc::ioctl(fd, eviocgbit(EV_KEY, key_bits.len()), key_bits.as_mut_ptr());
+            libc::ioctl(fd, eviocgbit(EV_REL, rel_bits.len()), rel_bits.as_mut_ptr());
+            libc::ioctl(fd, eviocgname(name.len() - 1), name.as_mut_ptr());
+            libc::ioctl(fd, EVIOCGID, id.as_mut_ptr());
         }
         let has = |bits: &[u8], code: u16| bits[code as usize / 8] & (1 << (code % 8)) != 0;
 
@@ -159,10 +188,37 @@ impl Device {
             Pointer::Relative
         };
 
+        let kind = match pointer {
+            Pointer::Touchpad { .. } => Some(Kind::Touchpad),
+            // A screen is touched; anything else that says where it is has
+            // buttons of its own.
+            Pointer::Absolute { .. } if has(&key_bits, BTN_LEFT) => Some(Kind::Tablet),
+            Pointer::Absolute { .. } => Some(Kind::Touchscreen),
+            Pointer::Relative
+                if has(&rel_bits, REL_X) && has(&rel_bits, REL_Y) && has(&key_bits, BTN_LEFT) =>
+            {
+                Some(Kind::Mouse)
+            }
+            // Letters and Enter: not a case's two or three buttons.
+            Pointer::Relative
+                if has(&key_bits, KEY_A) && has(&key_bits, KEY_Z) && has(&key_bits, KEY_ENTER) =>
+            {
+                Some(Kind::Keyboard)
+            }
+            Pointer::Relative => None,
+        };
+        let length = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        let found = kind.map(|kind| Found {
+            kind,
+            built_in: BUILT_IN_BUSES.contains(&id[0]),
+            name: String::from_utf8_lossy(&name[..length]).trim().to_string(),
+        });
+
         Some(Device {
             path,
             file,
             pointer,
+            found,
             finger: None,
             abs: (None, None),
             touching: false,
@@ -240,6 +296,12 @@ impl Input {
                 self.devices.push(device);
             }
         }
+        self.tell();
+    }
+
+    /// Say what devices there are now.
+    fn tell(&self) {
+        devices::set(self.devices.iter().filter_map(|d| d.found.clone()).collect());
     }
 
     pub(super) fn held(&self) -> &[Key] {
@@ -292,8 +354,11 @@ impl Input {
         for i in 0..self.devices.len() {
             self.apply_absolute(i);
         }
-        for i in gone.into_iter().rev() {
-            self.devices.remove(i);
+        if !gone.is_empty() {
+            for i in gone.into_iter().rev() {
+                self.devices.remove(i);
+            }
+            self.tell();
         }
 
         self.wheel = self.wheel_acc;
@@ -362,15 +427,19 @@ impl Input {
                             // The pad's width covers about the screen's width.
                             let sx = bounds.0 / (x.1 - x.0) as f64;
                             let sy = bounds.1 / (y.1 - y.0) as f64;
-                            let s = sx.min(sy) * crate::pointer::speed();
+                            let s = sx.min(sy) * crate::pointer::pad_speed();
                             self.move_by(dx as f64 * s, dy as f64 * s);
                         }
                         // As a wheel turns: fingers drawn toward the user
                         // are the wheel turned toward the user, which
                         // Shine counts as negative.
                         Moves::Scroll => {
-                            self.wheel_acc.0 += across * touchpad::NOTCHES_A_PAD;
-                            self.wheel_acc.1 -= down * touchpad::NOTCHES_A_PAD;
+                            let (wx, wy) = crate::pointer::pad_wheel((
+                                across * touchpad::NOTCHES_A_PAD,
+                                -down * touchpad::NOTCHES_A_PAD,
+                            ));
+                            self.wheel_acc.0 += wx;
+                            self.wheel_acc.1 += wy;
                         }
                     }
                 }
@@ -438,7 +507,8 @@ impl Input {
                     // A touchpad's is not, unless it was a tap.
                     Pointer::Touchpad { .. } if down => d.touch.began(now),
                     Pointer::Touchpad { .. } => {
-                        if let Some(button) = d.touch.ended(now, typing) {
+                        let tapped = d.touch.ended(now, typing);
+                        if let Some(button) = tapped.filter(|_| crate::pointer::tap_to_click()) {
                             self.buttons[button] = true;
                             self.tap = Some((button, now + TAP_HELD));
                         }
@@ -456,13 +526,16 @@ impl Input {
     }
 
     fn keyboard(&mut self, code: u16, value: i32) {
+        // A layout's AltGr picks a key's third character: it is part of
+        // typing, and no program is told Alt is held.
+        let third_level = code == KEY_RIGHTALT && layout::is_third_level(code);
         match code {
             KEY_LEFTSHIFT => self.shift[0] = value != 0,
             KEY_RIGHTSHIFT => self.shift[1] = value != 0,
             KEY_LEFTCTRL => self.ctrl[0] = value != 0,
             KEY_RIGHTCTRL => self.ctrl[1] = value != 0,
             KEY_LEFTALT => self.alt[0] = value != 0,
-            KEY_RIGHTALT => self.alt[1] = value != 0,
+            KEY_RIGHTALT => self.alt[1] = value != 0 && !third_level,
             KEY_CAPSLOCK if value == 1 => self.caps = !self.caps,
             _ => {}
         }
@@ -476,34 +549,62 @@ impl Input {
             unsafe { libc::kill(1, libc::SIGINT) };
         }
 
-        let Some(key) = keymap::key(code) else {
+        // The volume and brightness keys and their like: events by name,
+        // again for each of the kernel's repeats, so holding one goes on
+        // turning the volume.
+        if let Some(name) = keymap::named(code) {
+            crate::keyboard::push_named(name, value != 0);
             return;
-        };
-        let mut collector = TextCollector;
+        }
 
-        // 1 = press, 0 = release, 2 = the kernel's auto-repeat. Repeats are
-        // not new presses — Shine times key repeat itself — but they do type
-        // the character again, as holding a key does everywhere.
-        match value {
-            1 => {
-                if !self.held.contains(&key) {
-                    self.held.push(key);
+        // What the key types is asked of the layout before the layout
+        // counts it as down: 1 = press, 0 = release, 2 = the kernel's
+        // auto-repeat, which types the character again and changes nothing.
+        let typed = if value == 0 {
+            Typed::Text(None)
+        } else {
+            layout::typed(code)
+        };
+        if value != 2 {
+            layout::moved(code, value == 1);
+        }
+        if third_level {
+            return;
+        }
+
+        // Repeats are not new presses: Shine times key repeat itself.
+        let mut collector = TextCollector;
+        if let Some(key) = keymap::key(code) {
+            match value {
+                1 => {
+                    if !self.held.contains(&key) {
+                        self.held.push(key);
+                    }
+                    collector.set_key_state(key, true);
                 }
-                collector.set_key_state(key, true);
+                0 => {
+                    self.held.retain(|&k| k != key);
+                    collector.set_key_state(key, false);
+                }
+                _ => {}
             }
-            0 => {
-                self.held.retain(|&k| k != key);
-                collector.set_key_state(key, false);
-                return;
-            }
-            _ => {}
         }
 
         // Ctrl and Alt combinations are shortcuts, not typing.
-        if !ctrl && !alt {
-            let shift = self.shift.iter().any(|&d| d);
-            if let Some(ch) = keymap::text(code, shift, self.caps) {
-                collector.add_char(ch as u32);
+        if value == 0 || ctrl || alt {
+            return;
+        }
+        match typed {
+            Typed::BuiltIn => {
+                let shift = self.shift.iter().any(|&d| d);
+                if let Some(ch) = keymap::text(code, shift, self.caps) {
+                    collector.add_char(ch as u32);
+                }
+            }
+            Typed::Text(text) => {
+                for ch in text.unwrap_or_default().chars() {
+                    collector.add_char(ch as u32);
+                }
             }
         }
     }
