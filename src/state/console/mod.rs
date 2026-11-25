@@ -13,6 +13,7 @@ mod display;
 mod gpu;
 mod input;
 mod keymap;
+mod touchpad;
 mod vt;
 
 use minifb::{CursorStyle, Key};

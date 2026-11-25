@@ -11,8 +11,10 @@
 //!   netbook's): movement is added to the pointer position.
 //! - **absolute** (tablets, touchscreens, QEMU's `usb-tablet`): a position
 //!   in the device's own range, scaled to the screen.
-//! - **touchpads reporting absolute finger positions**: the finger's
-//!   movement while it touches is turned into relative movement.
+//! - **touchpads reporting absolute finger positions** (a PS/2 touchpad
+//!   the kernel knows the maker of, and every newer laptop's): the finger's
+//!   movement while it touches is turned into relative movement, two
+//!   fingers scroll, and a tap clicks (see [`super::touchpad`]).
 //!
 //! Keystrokes and typed text go straight into
 //! [`crate::keyboard::TextCollector`], as minifb's own callback does, so the
@@ -30,6 +32,7 @@ use std::time::{Duration, Instant};
 use minifb::{InputCallback, Key};
 
 use super::keymap;
+use super::touchpad::{self, Moves, Touch};
 use crate::keyboard::TextCollector;
 
 const EV_KEY: u16 = 0x01;
@@ -48,7 +51,15 @@ const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 const BTN_TOOL_FINGER: u16 = 0x145;
+const BTN_TOOL_QUINTTAP: u16 = 0x148;
 const BTN_TOUCH: u16 = 0x14a;
+const BTN_TOOL_DOUBLETAP: u16 = 0x14d;
+const BTN_TOOL_TRIPLETAP: u16 = 0x14e;
+const BTN_TOOL_QUADTAP: u16 = 0x14f;
+
+/// How long a tap on a touchpad holds its button down: long enough for a
+/// program to see it pressed in one frame and let go in a later one.
+const TAP_HELD: Duration = Duration::from_millis(50);
 
 const KEY_LEFTCTRL: u16 = 29;
 const KEY_LEFTSHIFT: u16 = 42;
@@ -106,6 +117,10 @@ struct Device {
     /// The absolute position this frame's events are building up.
     abs: (Option<i32>, Option<i32>),
     touching: bool,
+    /// Touchpads: the gesture under way.
+    touch: Touch,
+    /// Touchpads: the button a press of the pad itself went down as.
+    pad_button: usize,
 }
 
 impl Device {
@@ -151,6 +166,8 @@ impl Device {
             finger: None,
             abs: (None, None),
             touching: false,
+            touch: Touch::default(),
+            pad_button: 0,
         })
     }
 }
@@ -172,6 +189,11 @@ pub(super) struct Input {
     ctrl: [bool; 2],
     alt: [bool; 2],
     caps: bool,
+    /// A tap on a touchpad: the button it is holding down, and until when.
+    tap: Option<(usize, Instant)>,
+    /// When a key was last pressed: a tap straight after is a hand
+    /// brushing the pad.
+    typed: Option<Instant>,
 }
 
 impl Input {
@@ -191,6 +213,8 @@ impl Input {
             ctrl: [false; 2],
             alt: [false; 2],
             caps: false,
+            tap: None,
+            typed: None,
         };
         input.scan();
         input
@@ -226,6 +250,13 @@ impl Input {
     pub(super) fn pump(&mut self) {
         if self.last_scan.elapsed() >= RESCAN_EVERY {
             self.scan();
+        }
+        // A tap lets go of its button, having held it at least a frame.
+        if let Some((button, until)) = self.tap
+            && Instant::now() >= until
+        {
+            self.buttons[button] = false;
+            self.tap = None;
         }
 
         let mut events = Vec::new();
@@ -323,11 +354,25 @@ impl Input {
                 let moved = d.finger.map(|_| (nx - last_x, ny - last_y));
                 d.finger = Some((nx, ny));
                 if let Some((dx, dy)) = moved {
-                    // The pad's width covers about the screen's width.
-                    let sx = bounds.0 / (x.1 - x.0) as f64;
-                    let sy = bounds.1 / (y.1 - y.0) as f64;
-                    let s = sx.min(sy) * crate::pointer::speed();
-                    self.move_by(dx as f64 * s, dy as f64 * s);
+                    // As shares of the pad: what gestures are measured in.
+                    let across = dx as f64 / (x.1 - x.0) as f64;
+                    let down = dy as f64 / (y.1 - y.0) as f64;
+                    match d.touch.moved(across.abs() + down.abs()) {
+                        Moves::Pointer => {
+                            // The pad's width covers about the screen's width.
+                            let sx = bounds.0 / (x.1 - x.0) as f64;
+                            let sy = bounds.1 / (y.1 - y.0) as f64;
+                            let s = sx.min(sy) * crate::pointer::speed();
+                            self.move_by(dx as f64 * s, dy as f64 * s);
+                        }
+                        // As a wheel turns: fingers drawn toward the user
+                        // are the wheel turned toward the user, which
+                        // Shine counts as negative.
+                        Moves::Scroll => {
+                            self.wheel_acc.0 += across * touchpad::NOTCHES_A_PAD;
+                            self.wheel_acc.1 -= down * touchpad::NOTCHES_A_PAD;
+                        }
+                    }
                 }
             }
         }
@@ -346,23 +391,67 @@ impl Input {
 
     fn key(&mut self, device: usize, code: u16, value: i32) {
         let down = value != 0;
+        let touchpad = matches!(self.devices[device].pointer, Pointer::Touchpad { .. });
         match code {
+            // A touchpad's own button, where the whole pad is the button:
+            // the secondary one with two fingers on it.
+            BTN_LEFT if touchpad => {
+                let d = &mut self.devices[device];
+                if down {
+                    d.pad_button = d.touch.pressed();
+                }
+                self.buttons[d.pad_button] = down;
+            }
             BTN_LEFT => self.buttons[0] = down,
             BTN_RIGHT => self.buttons[1] = down,
             BTN_MIDDLE => self.buttons[2] = down,
+            BTN_TOOL_FINGER | BTN_TOOL_DOUBLETAP | BTN_TOOL_TRIPLETAP | BTN_TOOL_QUADTAP
+            | BTN_TOOL_QUINTTAP
+                if touchpad =>
+            {
+                let count = match code {
+                    BTN_TOOL_FINGER => 1,
+                    BTN_TOOL_DOUBLETAP => 2,
+                    BTN_TOOL_TRIPLETAP => 3,
+                    BTN_TOOL_QUADTAP => 4,
+                    _ => 5,
+                };
+                let d = &mut self.devices[device];
+                // Another finger's position from now: no jump to it.
+                if d.touch.fingers(count, down) {
+                    d.finger = None;
+                }
+            }
             BTN_TOUCH => {
+                let now = Instant::now();
+                let typing = self
+                    .typed
+                    .is_some_and(|at| now.duration_since(at) < touchpad::WHILE_TYPING);
                 let d = &mut self.devices[device];
                 d.touching = down;
                 if !down {
                     d.finger = None;
                 }
-                // A touchscreen's touch is its click; a touchpad's is not
-                // (its buttons, or its own tap-to-click, send BTN_LEFT).
-                if matches!(d.pointer, Pointer::Absolute { .. }) {
-                    self.buttons[0] = down;
+                match d.pointer {
+                    // A touchscreen's touch is its click.
+                    Pointer::Absolute { .. } => self.buttons[0] = down,
+                    // A touchpad's is not, unless it was a tap.
+                    Pointer::Touchpad { .. } if down => d.touch.began(now),
+                    Pointer::Touchpad { .. } => {
+                        if let Some(button) = d.touch.ended(now, typing) {
+                            self.buttons[button] = true;
+                            self.tap = Some((button, now + TAP_HELD));
+                        }
+                    }
+                    Pointer::Relative => {}
                 }
             }
-            _ => self.keyboard(code, value),
+            _ => {
+                if value == 1 {
+                    self.typed = Some(Instant::now());
+                }
+                self.keyboard(code, value)
+            }
         }
     }
 
