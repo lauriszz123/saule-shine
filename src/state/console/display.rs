@@ -117,6 +117,14 @@ struct Frame {
     fb: framebuffer::Handle,
 }
 
+/// How long a page flip's event is waited for. One comes within a refresh,
+/// 17 ms or so; one that hasn't come in this long is not coming. That
+/// happens across a sleep: the machine was suspended with a flip asked
+/// for, and some drivers (a virtual machine's) wake having forgotten it,
+/// and the screen's mode with it. Waiting for ever would freeze whatever
+/// is drawing, so the wait ends, and the next frame sets the mode again.
+const FLIP_TIME: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub(super) struct Display {
     card: Card,
     crtc: crtc::Handle,
@@ -131,6 +139,10 @@ pub(super) struct Display {
     flipping: bool,
     /// A flip was asked for and its completion event not yet read.
     flip_pending: bool,
+    /// A flip's event never came: the next frame sets the screen's mode
+    /// again with its buffer rather than flipping to it (see
+    /// [`FLIP_TIME`]).
+    reassert: bool,
     /// The hardware cursor's image, while the driver has one.
     cursor: Option<Mapped>,
 }
@@ -203,6 +215,7 @@ impl Display {
             front: 0,
             flipping: true,
             flip_pending: false,
+            reassert: false,
             cursor: None,
         };
         for _ in 0..2 {
@@ -276,6 +289,9 @@ impl Display {
     /// flip before it has landed, as `present` shows a dumb buffer.
     pub(super) fn flip_to(&mut self, fb: framebuffer::Handle) {
         self.wait_for_flip();
+        if self.reasserted(fb) {
+            return;
+        }
         if self.flipping {
             match self.card.page_flip(self.crtc, fb, PageFlipFlags::EVENT, None) {
                 Ok(()) => {
@@ -323,6 +339,10 @@ impl Display {
         overlay(bytes, pitch, sw, sh);
 
         let fb = frame.fb;
+        if self.reasserted(fb) {
+            self.front = target;
+            return;
+        }
         if self.flipping {
             match self
                 .card
@@ -350,9 +370,38 @@ impl Display {
         let _ = self.card.dirty_framebuffer(fb, &[]);
     }
 
-    /// Block until the last page flip has happened.
+    /// After a flip whose event never came, show `fb` by setting the
+    /// screen's mode with it: true when that was done in place of a flip.
+    fn reasserted(&mut self, fb: framebuffer::Handle) -> bool {
+        if !self.reassert {
+            return false;
+        }
+        self.reassert = false;
+        let _ = self.card.set_crtc_fb(self.crtc, fb);
+        let _ = self.card.dirty_framebuffer(fb, &[]);
+        true
+    }
+
+    /// Whether the card has an event to read within [`FLIP_TIME`].
+    fn event_due(&self) -> bool {
+        let mut poll = libc::pollfd {
+            fd: self.card.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Safety: one valid pollfd, for the length of the call.
+        unsafe { libc::poll(&mut poll, 1, FLIP_TIME.as_millis() as libc::c_int) > 0 }
+    }
+
+    /// Block until the last page flip has happened, or plainly isn't going
+    /// to.
     fn wait_for_flip(&mut self) {
         while self.flip_pending {
+            if !self.event_due() {
+                self.flip_pending = false;
+                self.reassert = true;
+                return;
+            }
             match self.card.receive_events() {
                 Ok(events) => {
                     for event in events {
