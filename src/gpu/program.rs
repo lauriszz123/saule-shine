@@ -1,5 +1,7 @@
-//! The shader programs, written once for OpenGL ES 2.0 and desktop OpenGL
-//! 2.1: the same GLSL with each dialect's first lines.
+//! The shader programs, written once for OpenGL ES 2.0, desktop OpenGL 2.1
+//! and a core profile (macOS's): the same GLSL with each dialect's first
+//! lines (see [`header`]). They write their colour to `shineColour`, which
+//! each dialect's first lines say where to put.
 //!
 //! ## Colours on the GPU
 //!
@@ -17,15 +19,35 @@ use glow::HasContext;
 /// The first lines of every shader, for the context's dialect. A fragment
 /// shader asks for high precision where ES has it: positions up to 16384
 /// pixels need more than ES's medium precision.
-fn header(es: bool, fragment: bool) -> &'static str {
-    match (es, fragment) {
-        (true, true) => {
+///
+/// A core profile (`core`, see `gpu::core_profile`) takes GLSL 1.50 and not
+/// 1.20, where what 1.20 called `attribute` and `varying` are a stage's
+/// `in` and `out`, `texture2D` is `texture`, and a fragment shader's colour
+/// goes to an output it declares. The words of 1.20 are made to mean those,
+/// so one source serves every dialect, programs' own shaders included.
+fn header(es: bool, core: bool, fragment: bool) -> &'static str {
+    match (es, core, fragment) {
+        (true, _, true) => {
             "#version 100\n\
              #ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n\
-             #else\nprecision mediump float;\n#endif\n"
+             #else\nprecision mediump float;\n#endif\n\
+             #define shineColour gl_FragColor\n"
         }
-        (true, false) => "#version 100\nprecision highp float;\n",
-        (false, _) => "#version 120\n",
+        (true, _, false) => "#version 100\nprecision highp float;\n",
+        (false, true, true) => {
+            "#version 150\n\
+             #define varying in\n\
+             #define texture2D texture\n\
+             out vec4 shineColour;\n"
+        }
+        (false, true, false) => {
+            "#version 150\n\
+             #define attribute in\n\
+             #define varying out\n\
+             #define texture2D texture\n"
+        }
+        (false, false, true) => "#version 120\n#define shineColour gl_FragColor\n",
+        (false, false, false) => "#version 120\n",
     }
 }
 
@@ -69,6 +91,7 @@ pub(super) unsafe fn link_variant(
     // SAFETY: the caller's context is current.
     unsafe {
         let program = gl.create_program().map_err(|e| format!("GL program: {e}"))?;
+        let core = super::core_profile(gl);
         let mut shaders = Vec::new();
         for (kind, fragment_stage, source) in [
             (glow::VERTEX_SHADER, false, vertex),
@@ -76,7 +99,7 @@ pub(super) unsafe fn link_variant(
         ] {
             let shader = gl.create_shader(kind).map_err(|e| format!("GL shader: {e}"))?;
             let chosen = if fragment_stage { defines } else { "" };
-            gl.shader_source(shader, &format!("{}{chosen}{source}", header(es, fragment_stage)));
+            gl.shader_source(shader, &format!("{}{chosen}{source}", header(es, core, fragment_stage)));
             gl.compile_shader(shader);
             if !gl.get_shader_compile_status(shader) {
                 return Err(format!(
@@ -186,7 +209,7 @@ impl PresentProgram {
             uniform sampler2D frame;
             varying vec2 uv;
             void main() {
-                gl_FragColor = vec4(texture2D(frame, uv).bgr, 1.0);
+                shineColour = vec4(texture2D(frame, uv).bgr, 1.0);
             }";
         // SAFETY: the caller's context is current.
         unsafe {
@@ -259,7 +282,7 @@ impl BlitProgram {
             }";
         let fragment = "
             uniform sampler2D image;
-            uniform vec2 textureSize;
+            uniform vec2 shineTextureSize;
             uniform vec4 sub;
             uniform vec4 tint;
             uniform float radius;
@@ -288,7 +311,7 @@ impl BlitProgram {
             #ifdef NEAREST
                 at = floor(at) + 0.5;
             #endif
-                vec4 sampled = texture2D(image, at / textureSize);
+                vec4 sampled = texture2D(image, at / shineTextureSize);
             #ifdef OPAQUE
                 sampled.a = 1.0;
             #endif
@@ -302,20 +325,20 @@ impl BlitProgram {
                 float sa = colour.a * cover;
             #if MODE == 0
                 // alpha, add, subtract: the colour, weighed by `sa`.
-                gl_FragColor = vec4(colour.rgb, sa);
+                shineColour = vec4(colour.rgb, sa);
             #elif MODE == 3
                 // multiply: the factor the target is multiplied by.
-                gl_FragColor = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
+                shineColour = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
             #elif MODE == 4
                 // screen: the colour already weighed.
-                gl_FragColor = vec4(colour.rgb * sa, sa);
+                shineColour = vec4(colour.rgb * sa, sa);
             #elif MODE == 5
                 // replace: as it is (only drawn with no partial cover).
-                gl_FragColor = colour;
+                shineColour = colour;
             #else
                 // premultiplied: the image's colours are weighed already; the tint's
                 // alpha and the cover weigh them further.
-                gl_FragColor = vec4(sampled.rgb * tint.rgb * tint.a * cover, sa);
+                shineColour = vec4(sampled.rgb * tint.rgb * tint.a * cover, sa);
             #endif
             }";
         let mut defines = format!("#define MODE {}\n", key.mode);
@@ -340,7 +363,7 @@ impl BlitProgram {
                 pad: uniform(gl, program, "pad"),
                 row0: uniform(gl, program, "row0"),
                 row1: uniform(gl, program, "row1"),
-                texture_size: uniform(gl, program, "textureSize"),
+                texture_size: uniform(gl, program, "shineTextureSize"),
                 sub: uniform(gl, program, "sub"),
                 tint: uniform(gl, program, "tint"),
                 radius: uniform(gl, program, "radius"),
@@ -465,11 +488,11 @@ impl ShapeProgram {
             #endif
                 float sa = source.a * c;
             #if MODE == 0
-                gl_FragColor = vec4(source.rgb, sa);
+                shineColour = vec4(source.rgb, sa);
             #elif MODE == 3
-                gl_FragColor = vec4(source.rgb * sa + 1.0 - sa, source.a * sa + 1.0 - sa);
+                shineColour = vec4(source.rgb * sa + 1.0 - sa, source.a * sa + 1.0 - sa);
             #else
-                gl_FragColor = vec4(source.rgb * sa, sa);
+                shineColour = vec4(source.rgb * sa, sa);
             #endif
             }";
         let mut defines = format!("#define MODE {}\n#define GRADIENT {}\n", key.mode, key.gradient);
@@ -579,11 +602,11 @@ impl GlyphProgram {
                 }
                 float sa = colour.a * a;
             #if MODE == 0
-                gl_FragColor = vec4(colour.rgb, sa);
+                shineColour = vec4(colour.rgb, sa);
             #elif MODE == 3
-                gl_FragColor = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
+                shineColour = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
             #else
-                gl_FragColor = vec4(colour.rgb * sa, sa);
+                shineColour = vec4(colour.rgb * sa, sa);
             #endif
             }";
         let sampling = match key.sampling {
@@ -672,11 +695,11 @@ impl FillBatchProgram {
                 }
                 float sa = colour.a * c;
                 if (mode < 0.5 || (mode > 0.5 && mode < 2.5)) {
-                    gl_FragColor = vec4(colour.rgb, sa);
+                    shineColour = vec4(colour.rgb, sa);
                 } else if (mode < 3.5) {
-                    gl_FragColor = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
+                    shineColour = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
                 } else {
-                    gl_FragColor = vec4(colour.rgb * sa, sa);
+                    shineColour = vec4(colour.rgb * sa, sa);
                 }
             }";
         // SAFETY: the caller's context is current.

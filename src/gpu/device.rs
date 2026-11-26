@@ -8,8 +8,8 @@ use std::num::NonZeroU32;
 use glow::HasContext;
 use glutin::config::{ConfigTemplateBuilder, GlConfig};
 use glutin::context::{
-    ContextApi, ContextAttributesBuilder, GlContext, NotCurrentGlContext, PossiblyCurrentContext,
-    Version,
+    ContextApi, ContextAttributesBuilder, GlContext, NotCurrentContext, NotCurrentGlContext,
+    PossiblyCurrentContext, PossiblyCurrentGlContext, Version,
 };
 use glutin::display::{Display, DisplayApiPreference, GlDisplay};
 use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
@@ -51,6 +51,11 @@ pub(crate) struct Device {
     /// A unit square (0,0)–(1,1) as a triangle strip: every quad drawn is
     /// this, placed by a vertex shader.
     pub(crate) quad: glow::Buffer,
+    /// In a core profile, the vertex array object every draw's attributes
+    /// are kept in: there is no drawing without one bound (see
+    /// `gpu::core_profile`). Bound once, as the device is made; none
+    /// elsewhere.
+    vertex_array: Option<glow::VertexArray>,
     /// The window surface's size in pixels, as it was last told.
     surface_size: Cell<(u32, u32)>,
     // Last, so they are dropped after the GL objects above are deleted.
@@ -89,7 +94,9 @@ impl Device {
         prefer_host_gpu();
         // SAFETY: both handles come from minifb's live window, which
         // outlives the device (the engine lets go of the GPU first).
-        unsafe { Device::on(raw_display, raw_window, preference(raw_window), true, width, height) }
+        unsafe {
+            Device::on(raw_display, raw_window, preference(raw_window), true, true, width, height)
+        }
     }
 
     /// A context drawing on the bare screen through GBM: `gbm_device` and
@@ -110,17 +117,21 @@ impl Device {
         let display = RawDisplayHandle::Gbm(GbmDisplayHandle::new(gbm_device));
         let window = RawWindowHandle::Gbm(GbmWindowHandle::new(gbm_surface));
         // SAFETY: the caller's.
-        unsafe { Device::on(display, window, DisplayApiPreference::Egl, false, width, height) }
+        unsafe { Device::on(display, window, DisplayApiPreference::Egl, false, false, width, height) }
     }
 
     /// A context on a native window, its surface `width` × `height`. The
     /// framebuffer has an alpha channel only when `alpha`: a GBM surface's
     /// format (XRGB) has none, and its configuration must match it.
+    /// `window_last` keeps the window out of it until the GPU is known to
+    /// draw: for a window on a desktop, which falls back to being drawn
+    /// without a GPU (see below).
     unsafe fn on(
         raw_display: raw_window_handle::RawDisplayHandle,
         raw_window: raw_window_handle::RawWindowHandle,
         preference: DisplayApiPreference,
         alpha: bool,
+        window_last: bool,
         width: usize,
         height: usize,
     ) -> Result<Device, String> {
@@ -150,29 +161,29 @@ impl Device {
             })
             .ok_or("no OpenGL configuration for this window")?;
 
-        // ES 2.0 first; desktop OpenGL 2.1 where ES isn't offered.
-        let mut last_error = String::new();
-        let mut not_current = None;
-        for api in [
-            ContextApi::Gles(Some(Version::new(2, 0))),
-            ContextApi::OpenGl(Some(Version::new(2, 1))),
-        ] {
-            let attributes = ContextAttributesBuilder::new()
-                .with_context_api(api)
-                .build(Some(raw_window));
-            // SAFETY: the configuration came from this display.
-            match unsafe { display.create_context(&config, &attributes) } {
-                Ok(context) => {
-                    not_current = Some(context);
-                    break;
-                }
-                Err(e) => last_error = e.to_string(),
+        let (w, h) = nonzero(width, height);
+
+        // Whether the GPU can draw at all is found out before the window is
+        // touched. Giving a window an OpenGL surface changes it for good:
+        // on macOS the view is made layer-backed and the context attached
+        // to it, and a context that then turned out unable to run Shine's
+        // shaders left the window blank, the frames the processor drew
+        // after it never shown. So the shaders are made on a context
+        // current on nothing, and the window is given to OpenGL only once
+        // they all work. Where a context can't be current on nothing, the
+        // window comes first, as it must.
+        if window_last {
+            let unattached = unsafe { Device::create_context(&display, &config, raw_window) }?;
+            if let Ok(context) = current_on_nothing(unattached) {
+                let mut device =
+                    Device::finish(display.clone(), context, None, (w.get(), h.get()))?;
+                // SAFETY: the caller's: the window is live.
+                unsafe { device.attach(&display, &config, raw_window, w, h) }?;
+                return Ok(device);
             }
         }
-        let not_current =
-            not_current.ok_or_else(|| format!("no OpenGL context: {last_error}"))?;
 
-        let (w, h) = nonzero(width, height);
+        let not_current = unsafe { Device::create_context(&display, &config, raw_window) }?;
         let attributes =
             SurfaceAttributesBuilder::<WindowSurface>::new().build(raw_window, w, h);
         // SAFETY: the window is live, and the configuration is compatible
@@ -186,6 +197,65 @@ impl Device {
         // would halve the rate of a loop that just misses one.
         let _ = surface.set_swap_interval(&context, SwapInterval::DontWait);
         Device::finish(display, context, Some(surface), (w.get(), h.get()))
+    }
+
+    /// A context for `config`, not yet current: OpenGL ES 2.0 first,
+    /// desktop OpenGL 2.1 where ES isn't offered.
+    ///
+    /// # Safety
+    ///
+    /// `raw_window` is live, and `config` came from `display`.
+    unsafe fn create_context(
+        display: &Display,
+        config: &glutin::config::Config,
+        raw_window: raw_window_handle::RawWindowHandle,
+    ) -> Result<glutin::context::NotCurrentContext, String> {
+        let mut last_error = String::new();
+        for api in [
+            ContextApi::Gles(Some(Version::new(2, 0))),
+            ContextApi::OpenGl(Some(Version::new(2, 1))),
+        ] {
+            let attributes = ContextAttributesBuilder::new()
+                .with_context_api(api)
+                .build(Some(raw_window));
+            // SAFETY: the caller's: the configuration came from this display.
+            match unsafe { display.create_context(config, &attributes) } {
+                Ok(context) => return Ok(context),
+                Err(e) => last_error = e.to_string(),
+            }
+        }
+        Err(format!("no OpenGL context: {last_error}"))
+    }
+
+    /// Draw into `raw_window` from now on: a device made with no window
+    /// (see [`Device::on`]) given one, its surface `w` × `h` pixels.
+    ///
+    /// # Safety
+    ///
+    /// `raw_window` is live, and `config` came from `display`, the device's
+    /// display.
+    unsafe fn attach(
+        &mut self,
+        display: &Display,
+        config: &glutin::config::Config,
+        raw_window: raw_window_handle::RawWindowHandle,
+        w: NonZeroU32,
+        h: NonZeroU32,
+    ) -> Result<(), String> {
+        let attributes =
+            SurfaceAttributesBuilder::<WindowSurface>::new().build(raw_window, w, h);
+        // SAFETY: the caller's.
+        let surface = unsafe { display.create_window_surface(config, &attributes) }
+            .map_err(|e| format!("no OpenGL surface: {e}"))?;
+        self.context
+            .make_current(&surface)
+            .map_err(|e| format!("cannot use the OpenGL context: {e}"))?;
+        // Shine paces its own frames; waiting for the display here as well
+        // would halve the rate of a loop that just misses one.
+        let _ = surface.set_swap_interval(&self.context, SwapInterval::DontWait);
+        self.surface = Some(surface);
+        self.surface_size.set((w.get(), h.get()));
+        Ok(())
     }
 
     /// A device with no window, drawing only into textures: the first EGL
@@ -327,6 +397,13 @@ impl Device {
             blit_programs.get(PLAIN_BLIT, || blit);
             shape_programs.get(PLAIN_SHAPE, || shape);
             glyph_programs.get(PLAIN_GLYPH, || glyph);
+            let vertex_array = if super::core_profile(&gl) {
+                let array = gl.create_vertex_array().map_err(|e| format!("GL vertex array: {e}"))?;
+                gl.bind_vertex_array(Some(array));
+                Some(array)
+            } else {
+                None
+            };
             let atlas = RefCell::new(Atlas::new(&gl)?);
             let shapes = RefCell::new(Atlas::new(&gl)?);
             let stream = gl.create_buffer().map_err(|e| format!("GL buffer: {e}"))?;
@@ -357,6 +434,7 @@ impl Device {
                 egl,
                 mask: Cell::new(None),
                 quad,
+                vertex_array,
                 surface_size: Cell::new(size),
                 context,
                 surface,
@@ -445,7 +523,27 @@ impl Drop for Device {
             if let Some((mask, _, _)) = self.mask.take() {
                 self.gl.delete_texture(mask);
             }
+            if let Some(array) = self.vertex_array {
+                self.gl.delete_vertex_array(array);
+            }
         }
+    }
+}
+
+/// `context` made current on no surface, where its window-system
+/// interface allows that: shaders and textures can be made on it, and
+/// nothing is drawn anywhere. Each interface offers it under its own type,
+/// present where glutin builds that interface.
+fn current_on_nothing(context: NotCurrentContext) -> glutin::error::Result<PossiblyCurrentContext> {
+    match context {
+        #[cfg(target_os = "macos")]
+        NotCurrentContext::Cgl(c) => c.make_current_surfaceless().map(PossiblyCurrentContext::Cgl),
+        #[cfg(not(target_os = "macos"))]
+        NotCurrentContext::Egl(c) => c.make_current_surfaceless().map(PossiblyCurrentContext::Egl),
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+        NotCurrentContext::Glx(c) => c.make_current_surfaceless().map(PossiblyCurrentContext::Glx),
+        #[cfg(windows)]
+        NotCurrentContext::Wgl(c) => c.make_current_surfaceless().map(PossiblyCurrentContext::Wgl),
     }
 }
 

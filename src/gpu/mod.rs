@@ -65,19 +65,21 @@ static RENDERER: std::sync::Mutex<String> = std::sync::Mutex::new(String::new())
 /// Why the bare screen is not drawn by a GPU, when it is not.
 static PROBLEM: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
-/// The bare screen is drawn by the CPU, because of `reason`: kept for
+/// The screen is drawn by the CPU, because of `reason`: kept for
 /// [`graphics_get_renderer_problem`], and said on stderr, where a display
-/// server's log has it.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// server's log has it. Said the same way by every backend: a problem on a
+/// desktop is one too, and a program running there is how most of them are
+/// found.
 pub(crate) fn set_problem(reason: &str) {
     eprintln!("shine: drawing on the CPU: {reason}");
     *PROBLEM.lock().unwrap_or_else(|e| e.into_inner()) = reason.to_string();
 }
 
-/// `Graphics.getRendererProblem()` — why the bare screen is drawn by the
-/// processor and not a graphics chip: what the driver said, or which
-/// step of starting OpenGL on the screen failed. "" when a chip draws,
-/// and in a window on another desktop.
+/// `Graphics.getRendererProblem()` — why the screen is drawn by the
+/// processor and not a graphics chip: what the driver said, which step of
+/// starting OpenGL failed, or the setting that turned the GPU off
+/// ([`turned_off`]). "" when a chip draws, on the bare screen and in a
+/// window on a desktop alike.
 #[saule_sdk::saule_export(class = "Graphics", name = "getRendererProblem")]
 fn graphics_get_renderer_problem() -> String {
     PROBLEM.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -590,17 +592,19 @@ fn upload_mask(dev: &Device, (w, h): (usize, usize), bytes: &[u8]) -> (usize, us
                 ] {
                     gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
                 }
+                let (internal, format) = one_channel(gl);
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
-                    glow::LUMINANCE as i32,
+                    internal,
                     cw as i32,
                     ch as i32,
                     0,
-                    glow::LUMINANCE,
+                    format,
                     glow::UNSIGNED_BYTE,
                     glow::PixelUnpackData::Slice(None),
                 );
+                spread_red(gl);
                 dev.mask.set(Some((texture, cw, ch)));
                 (texture, cw, ch)
             }
@@ -609,14 +613,15 @@ fn upload_mask(dev: &Device, (w, h): (usize, usize), bytes: &[u8]) -> (usize, us
         // Fresh storage for every mask ("orphaning"): the last shape's draw
         // may not have run yet, and writing into the storage it reads would
         // make the driver wait for it. Given new storage, it doesn't.
+        let (internal, format) = one_channel(gl);
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
-            glow::LUMINANCE as i32,
+            internal,
             cw as i32,
             ch as i32,
             0,
-            glow::LUMINANCE,
+            format,
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(None),
         );
@@ -629,7 +634,7 @@ fn upload_mask(dev: &Device, (w, h): (usize, usize), bytes: &[u8]) -> (usize, us
             0,
             w as i32,
             h as i32,
-            glow::LUMINANCE,
+            format,
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(Some(&bytes[..w * h])),
         );
@@ -836,9 +841,77 @@ pub(crate) fn clear(dst: &Texture, color: [f32; 4], clip: Clip) {
     }
 }
 
+/// Whether `gl` is a core profile: OpenGL 3.2 or later with what 2.1 had
+/// taken out of it, which is what macOS gives every program (glutin asks it
+/// for 4.1 and nothing older). Three things differ there: shaders are GLSL
+/// 1.50 (`program::header`), a texture of one channel is `RED` where 2.1 and
+/// ES have `LUMINANCE` ([`one_channel`]), and nothing draws without a vertex
+/// array object bound (`Device::finish`). A compatibility context — what
+/// Linux's and Windows' drivers give for 2.1 — and ES have none of that, and
+/// are left as they were.
+pub(crate) fn core_profile(gl: &glow::Context) -> bool {
+    let version = gl.version();
+    if version.is_embedded || (version.major, version.minor) < (3, 2) {
+        return false;
+    }
+    // SAFETY: a query on the caller's current context, which is 3.2 or
+    // later, where the profile mask exists.
+    let mask = unsafe { gl.get_parameter_i32(glow::CONTEXT_PROFILE_MASK) };
+    mask & glow::CONTEXT_CORE_PROFILE_BIT as i32 != 0
+}
+
+/// A texture of one channel, a byte a pixel (glyphs, a shape's coverage):
+/// its internal format and its format. `LUMINANCE`, which reads as that
+/// byte in all three colours and opaque; in a core profile, which has
+/// none, `RED`, made to read the same way by [`spread_red`].
+pub(crate) fn one_channel(gl: &glow::Context) -> (i32, u32) {
+    if core_profile(gl) {
+        (glow::R8 as i32, glow::RED)
+    } else {
+        (glow::LUMINANCE as i32, glow::LUMINANCE)
+    }
+}
+
+/// Have the one-channel texture bound to `TEXTURE_2D` read as
+/// `LUMINANCE` does, in a core profile: its red in all three colours, and
+/// opaque. So no shader reads it differently on macOS. Elsewhere it already
+/// does.
+///
+/// # Safety
+///
+/// `gl` is current, with the texture bound.
+pub(crate) unsafe fn spread_red(gl: &glow::Context) {
+    if !core_profile(gl) {
+        return;
+    }
+    // SAFETY: the caller's.
+    unsafe {
+        for (channel, from) in [
+            (glow::TEXTURE_SWIZZLE_G, glow::RED),
+            (glow::TEXTURE_SWIZZLE_B, glow::RED),
+            (glow::TEXTURE_SWIZZLE_A, glow::ONE),
+        ] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, channel, from as i32);
+        }
+    }
+}
+
 /// Whether the GPU may be used at all: not when `SHINE_GPU=0`.
 pub(crate) fn wanted() -> bool {
     std::env::var_os("SHINE_GPU").is_none_or(|v| v != "0")
+}
+
+/// Why the processor draws when somebody chose that it should: the
+/// setting that says so, as a reason for [`set_problem`]. `None` when
+/// nothing turned the GPU off.
+pub(crate) fn turned_off() -> Option<&'static str> {
+    if !wanted() {
+        Some("the GPU is turned off (SHINE_GPU=0)")
+    } else if !drawing_wanted() {
+        Some("drawing on the GPU is turned off (SHINE_GPU_DRAW=0)")
+    } else {
+        None
+    }
 }
 
 /// Whether to say which way frames are presented.

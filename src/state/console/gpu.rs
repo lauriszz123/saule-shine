@@ -90,8 +90,8 @@ pub(super) struct ConsoleGpu {
 impl ConsoleGpu {
     /// OpenGL on `display`'s DRM device, at its size.
     pub(super) fn new(display: &Display) -> Result<ConsoleGpu, String> {
-        if !gpu::drawing_wanted() {
-            return Err("SHINE_GPU_DRAW=0".into());
+        if let Some(why) = gpu::turned_off() {
+            return Err(why.into());
         }
         let gbm = Gbm::load()?;
         let (width, height) = display.size();

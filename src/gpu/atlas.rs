@@ -121,7 +121,7 @@ impl Atlas {
                 corner.1 as i32,
                 cw as i32,
                 ch as i32,
-                glow::LUMINANCE,
+                super::one_channel(gl).1,
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(Some(&padded)),
             );
@@ -170,17 +170,19 @@ fn make_texture(gl: &glow::Context, size: usize) -> Result<glow::Texture, String
         // Zeroed, so the borders between glyphs read as nothing.
         let zeros = vec![0u8; size * size];
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        let (internal, format) = super::one_channel(gl);
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
-            glow::LUMINANCE as i32,
+            internal,
             size as i32,
             size as i32,
             0,
-            glow::LUMINANCE,
+            format,
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(Some(&zeros)),
         );
+        super::spread_red(gl);
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
         gl.active_texture(glow::TEXTURE0);
         Ok(texture)

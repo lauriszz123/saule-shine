@@ -105,6 +105,12 @@ impl Desktop {
             }
         }
 
+        // Turned off is a reason too, said as the console says it, so the
+        // window's program can tell why the processor draws.
+        if let Some(why) = crate::gpu::turned_off() {
+            crate::gpu::set_problem(why);
+        }
+
         let mut desktop = Desktop {
             gpu: None,
             gpu_tried: !crate::gpu::wanted(),
@@ -153,11 +159,7 @@ impl Desktop {
                 }
                 self.gpu = Some(presenter);
             }
-            Err(e) => {
-                if crate::gpu::tracing() {
-                    eprintln!("shine: no GPU ({e}); presenting without one");
-                }
-            }
+            Err(e) => crate::gpu::set_problem(&format!("no OpenGL for the window: {e}")),
         }
     }
 
@@ -172,9 +174,7 @@ impl Desktop {
             return false;
         };
         if let Err(e) = gpu.present(buf, w, h, win_w, win_h) {
-            if crate::gpu::tracing() {
-                eprintln!("shine: the GPU failed ({e}); presenting without it");
-            }
+            crate::gpu::set_problem(&format!("the GPU stopped showing frames: {e}"));
             self.gpu = None;
             return false;
         }

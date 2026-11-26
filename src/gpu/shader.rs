@@ -69,7 +69,7 @@ uniform vec2 size;
 uniform vec3 row0;
 uniform vec3 row1;
 uniform vec4 sub;
-uniform vec2 textureSize;
+uniform vec2 shineTextureSize;
 uniform vec2 texel;
 varying vec2 shinePixel;
 varying vec2 shineUv;
@@ -83,7 +83,7 @@ varying vec2 shineUv;
 const VERTEX_AFTER: &str = "
 void main() {
     shinePixel = corner * size;
-    shineUv = (sub.xy + shinePixel) / textureSize;
+    shineUv = (sub.xy + shinePixel) / shineTextureSize;
     CALL
     vec2 device = vec2(dot(row0, vec3(shinePixel, 1.0)), dot(row1, vec3(shinePixel, 1.0)));
     gl_Position = vec4(device / target * 2.0 - 1.0, 0.0, 1.0);
@@ -103,7 +103,7 @@ varying vec2 shineUv;
 
 const AFTER: &str = "
 void main() {
-    gl_FragColor = effect(shineTint, shineImage, shineUv, shinePixel).bgra;
+    shineColour = effect(shineTint, shineImage, shineUv, shinePixel).bgra;
 }
 ";
 
@@ -149,7 +149,7 @@ impl UserShader {
                 row0: at("row0"),
                 row1: at("row1"),
                 sub: at("sub"),
-                texture_size: at("textureSize"),
+                texture_size: at("shineTextureSize"),
                 tint: at("shineTint"),
                 texel: at("texel"),
                 named: RefCell::new(HashMap::new()),
