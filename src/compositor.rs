@@ -452,6 +452,16 @@ impl Handler for Apps {
                 Apps::commit_shared(from, int(id)?, int(index)? as usize, size)?;
                 Ok(Vec::new())
             }
+            // One clipboard for every app: the server's own, which is the
+            // desktop's where the server is a window on one.
+            "getClipboard" => Ok(vec![Wire::Str(crate::clipboard::text())]),
+            "setClipboard" => {
+                let [Wire::Str(text)] = args.as_slice() else {
+                    return Err("setClipboard(text)".into());
+                };
+                crate::clipboard::put(text.clone())?;
+                Ok(Vec::new())
+            }
             "setTitle" | "setCursor" => {
                 let [id, Wire::Str(text)] = args.as_slice() else {
                     return Err(format!("{method}(id, text)"));
@@ -505,7 +515,12 @@ impl Handler for Apps {
 /// reported closed by the next `poll`, so this does not fail for it.
 fn tell(id: i64, method: &str, args: Vec<Wire>) -> Result<(), String> {
     with_server(|s| {
-        let win = s.windows.get(&id).ok_or_else(|| format!("no window {id}"))?;
+        // A window that has closed is still on the screen for a moment
+        // where the server shows it going: what is said to it meanwhile
+        // goes nowhere.
+        let Some(win) = s.windows.get(&id) else {
+            return Ok(());
+        };
         let (conn, events) = (win.conn, win.events);
         if let Some(lp) = s.looper.as_mut() {
             let _ = lp.send(conn, events, method, args);

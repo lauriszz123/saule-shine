@@ -102,4 +102,17 @@ pub(crate) trait Backend {
     fn set_cursor(&mut self, cursor: CursorStyle);
 
     fn set_cursor_visible(&mut self, visible: bool);
+
+    /// The clipboard this window's display server keeps for all its apps:
+    /// `None` where the window is not in one, and the clipboard is the
+    /// system's or this process's own (see [`crate::clipboard`]).
+    fn clipboard(&mut self) -> Option<String> {
+        None
+    }
+
+    /// Put `text` on the display server's clipboard; false where there is
+    /// none to put it on.
+    fn set_clipboard(&mut self, _text: &str) -> bool {
+        false
+    }
 }

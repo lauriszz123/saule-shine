@@ -58,8 +58,6 @@ pub(crate) struct GpuState {
     pub(crate) screen: Mirror,
     /// By canvas slot; a slot with no entry has never been on the GPU.
     pub(crate) canvases: HashMap<usize, Mirror>,
-    /// What blurs work in, kept from one to the next (see `gpu::blur`).
-    pub(crate) blur: Option<gpu::blur::BlurTextures>,
 }
 
 /// A surface by where it lives in the renderer.
@@ -77,7 +75,6 @@ impl Renderer {
                 dev,
                 screen: Mirror::default(),
                 canvases: HashMap::new(),
-                blur: None,
             });
         }
     }
@@ -89,7 +86,6 @@ impl Renderer {
             dev,
             screen: Mirror::default(),
             canvases: HashMap::new(),
-            blur: None,
         });
     }
 
@@ -196,7 +192,7 @@ impl Renderer {
     /// Bring the GPU's copy of `which` up to date, making its texture if it
     /// has none; `overwrite` when every pixel is about to be replaced, so
     /// uploading the old ones would be wasted.
-    fn sync_gpu(&mut self, which: Which, overwrite: bool) -> Result<(), String> {
+    pub(super) fn sync_gpu(&mut self, which: Which, overwrite: bool) -> Result<(), String> {
         let Some(gpu) = self.gpu.as_mut() else {
             return Err("no GPU".into());
         };
@@ -239,7 +235,7 @@ impl Renderer {
     }
 
     /// The GPU drew on `which`: its CPU copy is stale.
-    fn touched_gpu(&mut self, which: Which) {
+    pub(super) fn touched_gpu(&mut self, which: Which) {
         if let Some(gpu) = self.gpu.as_mut() {
             let mirror = match which {
                 Which::Screen => Some(&mut gpu.screen),
@@ -254,7 +250,7 @@ impl Renderer {
         }
     }
 
-    fn texture(&self, which: Which) -> Option<&Texture> {
+    pub(super) fn texture(&self, which: Which) -> Option<&Texture> {
         let gpu = self.gpu.as_ref()?;
         match which {
             Which::Screen => gpu.screen.active(),
@@ -322,7 +318,7 @@ impl Renderer {
     /// meaningless) is made a proper image first, through the CPU, so
     /// blending onto it reads real alpha. Rare: nothing draws onto a
     /// window's frame but a test.
-    fn prepare_target(&mut self, which: Which) {
+    pub(super) fn prepare_target(&mut self, which: Which) {
         if self.is_opaque_frame(which) {
             self.touch_cpu(which);
         }
@@ -385,35 +381,6 @@ impl Renderer {
                 m.opaque = false;
             }
         }
-        true
-    }
-
-    /// Blur `area` of the target on the GPU (see `raster::blur`). `false`
-    /// when it has to be done on the CPU instead.
-    pub(crate) fn gpu_blur(&mut self, area: &raster::BlurArea) -> bool {
-        if !self.on_gpu() {
-            return false;
-        }
-        let which = self.which_target();
-        self.prepare_target(which);
-        if self.sync_gpu(which, false).is_err() {
-            return false;
-        }
-        let size = self.target_size();
-        let Some(gpu) = self.gpu.as_mut() else {
-            return false;
-        };
-        let kept = gpu.blur.take();
-        match gpu::blur::BlurTextures::fit(&gpu.dev, kept, area, size) {
-            Ok(textures) => gpu.blur = Some(textures),
-            Err(_) => return false,
-        }
-        let (Some(texture), Some(textures)) = (self.texture(which), self.gpu.as_ref().and_then(|g| g.blur.as_ref()))
-        else {
-            return false;
-        };
-        gpu::blur::blur(texture, textures, area);
-        self.touched_gpu(which);
         true
     }
 
@@ -498,17 +465,20 @@ impl Renderer {
                     bytes: &mask,
                 },
             };
-            gpu::fill(
-                texture,
-                &gpu::Fill {
-                    colour: paint.color,
-                    gradient: paint.gradient,
-                    antialias: paint.antialias,
-                    blend: paint.blend,
-                    area,
-                },
-                cover,
-            );
+            let fill = gpu::Fill {
+                colour: paint.color,
+                gradient: paint.gradient,
+                antialias: paint.antialias,
+                blend: paint.blend,
+                area,
+            };
+            // A GPU that cannot run this fill's shader: the CPU's, then.
+            // It is the same shader for every piece of the shape, so the
+            // first one says, before anything is drawn.
+            if !gpu::fill(texture, &fill, cover) {
+                self.scratch.mask = mask;
+                return false;
+            }
         }
         self.scratch.mask = mask;
         self.touched_gpu(target);
@@ -681,22 +651,16 @@ impl Renderer {
             return Some(false);
         }
         let texture = self.texture(target)?;
-        gpu::fill(
-            texture,
-            &gpu::Fill {
-                colour: paint.color,
-                gradient: paint.gradient,
-                antialias: paint.antialias,
-                blend: paint.blend,
-                area: gpu::Clip {
-                    x0: ax0,
-                    y0: ay0,
-                    x1: ax1,
-                    y1: ay1,
-                },
-            },
-            gpu::Cover::Kept { origin, corner },
-        );
+        let fill = gpu::Fill {
+            colour: paint.color,
+            gradient: paint.gradient,
+            antialias: paint.antialias,
+            blend: paint.blend,
+            area: gpu::Clip { x0: ax0, y0: ay0, x1: ax1, y1: ay1 },
+        };
+        if !gpu::fill(texture, &fill, gpu::Cover::Kept { origin, corner }) {
+            return Some(false);
+        }
         self.touched_gpu(target);
         Some(true)
     }
@@ -817,7 +781,7 @@ impl Renderer {
         let (Some(src), Some(dst)) = (self.texture(source), self.texture(target)) else {
             return false;
         };
-        gpu::blit(
+        let drawn = gpu::blit(
             dst,
             src,
             &gpu::Blit {
@@ -832,8 +796,10 @@ impl Renderer {
                 blend: paint.blend,
             },
         );
-        self.touched_gpu(target);
-        true
+        if drawn {
+            self.touched_gpu(target);
+        }
+        drawn
     }
 }
 

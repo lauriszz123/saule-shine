@@ -194,6 +194,7 @@ fn open_backend(
 pub(crate) enum Res {
     Surface(i64),
     Font(i64),
+    Shader(i64),
 }
 
 thread_local! {
@@ -223,6 +224,7 @@ pub(crate) fn flush_releases(r: &mut Renderer) {
         let outcome = match res {
             Res::Surface(h) => r.release_canvas(h),
             Res::Font(h) => r.release_font(h),
+            Res::Shader(h) => r.release_shader(h),
         };
         if let Err(e) = outcome
             && (e.contains("current render target")

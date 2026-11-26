@@ -24,6 +24,11 @@ struct Feel {
     pad_scroll: f64,
     pad_natural: bool,
     tap: bool,
+    /// A mouse moved fast goes further; a tap and a touch drags; a scroll
+    /// let go of while moving carries on.
+    quick: bool,
+    tap_drag: bool,
+    coasts: bool,
 }
 
 static FEEL: Mutex<Feel> = Mutex::new(Feel {
@@ -35,6 +40,9 @@ static FEEL: Mutex<Feel> = Mutex::new(Feel {
     pad_scroll: 1.0,
     pad_natural: false,
     tap: true,
+    quick: true,
+    tap_drag: true,
+    coasts: true,
 });
 
 fn feel() -> Feel {
@@ -48,6 +56,40 @@ fn change(f: impl FnOnce(&mut Feel)) {
 /// How far the pointer goes for a mouse's movement.
 pub(crate) fn speed() -> f64 {
     feel().speed
+}
+
+/// Whether a mouse moved fast goes further ([`quickened`]).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn quickens() -> bool {
+    feel().quick
+}
+
+/// Whether a touch straight after a tap holds the tap's button.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn tap_drags() -> bool {
+    feel().tap_drag
+}
+
+/// Whether a scroll let go of while moving carries on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn coasts() -> bool {
+    feel().coasts
+}
+
+/// How much further a mouse moved at `speed`, in its counts a second,
+/// takes the pointer than its counts say: nothing further when slow,
+/// where a pixel is aimed at, rising to twice as far for a sweep of the
+/// arm, so that the screen is crossed without lifting the mouse.
+///
+/// A mouse counts about forty to the millimetre: 400 a second is a
+/// centimetre a second, the hand placing the pointer; 1900 is a quick
+/// flick of the wrist.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn quickened(speed: f64) -> f64 {
+    const FROM: f64 = 400.0;
+    const TO: f64 = 1900.0;
+    const MOST: f64 = 2.0;
+    1.0 + (MOST - 1.0) * ((speed - FROM) / (TO - FROM)).clamp(0.0, 1.0)
 }
 
 /// How far the pointer goes for a finger's movement on a touchpad.
@@ -149,9 +191,51 @@ fn mouse_set_tap_to_click(on: bool) {
     change(|f| f.tap = on);
 }
 
+/// `Mouse.setAcceleration(on)` — a mouse moved fast takes the pointer
+/// further than the same distance moved slowly, up to twice as far; off,
+/// the pointer goes as far as the mouse says however fast. On unless
+/// turned off.
+#[saule_export(class = "Mouse", name = "setAcceleration")]
+fn mouse_set_acceleration(on: bool) {
+    change(|f| f.quick = on);
+}
+
+/// `Mouse.setTapAndDrag(on)` — on a touchpad, a touch straight after a
+/// tap holds the primary button until it lifts, which drags what was
+/// tapped. Only where a tap is a click (`Mouse.setTapToClick`). On unless
+/// turned off.
+#[saule_export(class = "Mouse", name = "setTapAndDrag")]
+fn mouse_set_tap_and_drag(on: bool) {
+    change(|f| f.tap_drag = on);
+}
+
+/// `Mouse.setTouchpadInertia(on)` — two fingers' scroll let go of while
+/// moving carries on, slowing, until it has run down, the pad is touched
+/// or a key is pressed. On unless turned off.
+#[saule_export(class = "Mouse", name = "setTouchpadInertia")]
+fn mouse_set_touchpad_inertia(on: bool) {
+    change(|f| f.coasts = on);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mouse_moved_slowly_goes_as_far_as_it_says_and_faster_goes_further() {
+        // Placing the pointer: a count is a pixel.
+        assert_eq!(quickened(0.0), 1.0);
+        assert_eq!(quickened(300.0), 1.0);
+        // Faster is further, evenly, and never more than twice.
+        let mut last = 1.0;
+        for speed in (400..4000).step_by(100) {
+            let now = quickened(speed as f64);
+            assert!(now >= last && now <= 2.0, "{speed}: {now}");
+            assert!(now - last < 0.1, "a step at {speed}: {last} to {now}");
+            last = now;
+        }
+        assert_eq!(quickened(10_000.0), 2.0);
+    }
 
     #[test]
     fn a_touchpad_scrolls_its_own_way_whatever_the_wheel_does() {

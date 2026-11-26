@@ -96,21 +96,6 @@ impl Texture {
         }
     }
 
-    /// Copy `w` × `h` pixels of `src` from (`sx`, `sy`) to this texture's
-    /// corner, on the GPU.
-    pub(crate) fn copy_region_from(&self, src: &Texture, sx: usize, sy: usize, w: usize, h: usize) {
-        src.bind_target();
-        let gl = &self.dev.gl;
-        // SAFETY: GL calls on the current context, `src`'s framebuffer
-        // bound to read from; the region is inside both (the caller's).
-        unsafe {
-            gl.disable(glow::SCISSOR_TEST);
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.texture));
-            gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, sx as i32, sy as i32, w as i32, h as i32);
-        }
-    }
-
     /// Replace every pixel with `buf`'s (`w * h` of them, `0xAARRGGBB`).
     pub(crate) fn upload(&self, buf: &[u32]) {
         super::batch::flush(&self.dev);

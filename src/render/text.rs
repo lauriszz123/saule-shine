@@ -87,6 +87,18 @@ impl Renderer {
             .measure(text))
     }
 
+    /// Where each line of `text` starts in the current font, broken at
+    /// `limit` pixels (see `Font::wrap_starts`).
+    pub fn wrap_starts(&mut self, text: &str, limit: f64, soft: bool) -> Result<Vec<i64>, String> {
+        self.ensure_font()?;
+        let i = self.st.font;
+        Ok(self.fonts[i]
+            .value
+            .as_mut()
+            .expect("ensure_font ran before this call")
+            .wrap_starts(text, limit, soft))
+    }
+
     /// Draw a single line of text with its top-left corner at `(x, y)`.
     pub fn print(&mut self, text: &str, x: f64, y: f64) -> Result<(), String> {
         self.draw_text(text, x, y, None)

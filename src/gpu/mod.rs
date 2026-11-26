@@ -34,12 +34,12 @@
 
 mod atlas;
 pub(crate) mod batch;
-pub(crate) mod blur;
 mod device;
 #[cfg(target_os = "linux")]
 pub(crate) mod dmabuf;
 mod present;
 mod program;
+pub(crate) mod shader;
 mod texture;
 
 use glow::HasContext;
@@ -51,11 +51,59 @@ pub(crate) use texture::Texture;
 
 use crate::geom::Transform;
 use crate::raster::{BlendMode, Gradient, GradientKind};
+use program::{BlitKey, GlyphProgram, GlyphSampling, ShapeKey, TextKey, shader_mode};
 
 /// Whether drawing itself goes to the GPU, not only presenting: yes,
 /// unless `SHINE_GPU_DRAW=0` (or `SHINE_GPU=0`) says not. Everything Shine
 /// draws has a GPU path now but the replace blend mode and pixel-by-pixel
 /// image edits, which the CPU does on its copy (see `docs/gpu.md`).
+/// What the screen is being drawn by: the graphics chip's own name for
+/// itself (OpenGL's renderer string), or nothing while the processor
+/// draws. Said by whichever backend decides.
+static RENDERER: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Why the bare screen is not drawn by a GPU, when it is not.
+static PROBLEM: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The bare screen is drawn by the CPU, because of `reason`: kept for
+/// [`graphics_get_renderer_problem`], and said on stderr, where a display
+/// server's log has it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn set_problem(reason: &str) {
+    eprintln!("shine: drawing on the CPU: {reason}");
+    *PROBLEM.lock().unwrap_or_else(|e| e.into_inner()) = reason.to_string();
+}
+
+/// `Graphics.getRendererProblem()` — why the bare screen is drawn by the
+/// processor and not a graphics chip: what the driver said, or which
+/// step of starting OpenGL on the screen failed. "" when a chip draws,
+/// and in a window on another desktop.
+#[saule_sdk::saule_export(class = "Graphics", name = "getRendererProblem")]
+fn graphics_get_renderer_problem() -> String {
+    PROBLEM.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn set_renderer(description: &str) {
+    *RENDERER.lock().unwrap_or_else(|e| e.into_inner()) = description.to_string();
+}
+
+/// `Graphics.getRenderer()` — the graphics chip this window is drawn by,
+/// as it names itself ("OpenGL ES 3.2 Mesa · Mesa Intel(R) HD Graphics
+/// 530 (SKL GT2)"), or "" when the processor does the drawing: there is
+/// no chip, no driver for it, only a software OpenGL, or a chip that
+/// cannot run Shine's shaders. A program that can do without something
+/// costly (a blur that moves, a picture resized every frame) asks this.
+#[saule_sdk::saule_export(class = "Graphics", name = "getRenderer")]
+fn graphics_get_renderer() -> String {
+    // What the renderer is drawing on now; before there is a window to
+    // ask, what the bare screen said as it opened.
+    match crate::state::draw(|gfx| gfx.gpu.as_ref().map(|gpu| gpu.dev.description.clone())) {
+        Ok(drawn) => drawn.unwrap_or_default(),
+        Err(_) => RENDERER.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    }
+}
+
 pub(crate) fn drawing_wanted() -> bool {
     static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WANTED.get_or_init(|| wanted() && std::env::var_os("SHINE_GPU_DRAW").is_none_or(|v| v != "0"))
@@ -65,6 +113,64 @@ pub(crate) fn drawing_wanted() -> bool {
 /// whatever the GPU turns out to be.
 pub(crate) fn drawing_forced() -> bool {
     std::env::var_os("SHINE_GPU_DRAW").is_some_and(|v| v == "1")
+}
+
+/// Intel's graphics chips up to the third generation (the 8xx, 915, 945,
+/// G33 and Atom "Pineview" families: GMA 900 to 3150), by PCI device id.
+/// Their OpenGL stops at ES 2 with a few dozen instructions a shader, and
+/// its driver is the least exercised Mesa has. Apps are kept off it until
+/// it is known to work: on a GMA 3150, the one such chip tried, no app
+/// stayed open while trying the GPU was the default.
+const OLD_INTEL: [u16; 21] = [
+    0x3577, 0x2562, 0x3582, 0x358e, 0x2572, 0x2582, 0x258a, 0x2592, 0x2772, 0x27a2, 0x27ae,
+    0x29b2, 0x29c2, 0x29d2, 0xa001, 0xa011, 0x2776, 0x27a6, 0x2782, 0x2792, 0xa002,
+];
+
+/// Whether a chip with these PCI ids is one of [`OLD_INTEL`].
+pub(crate) fn old_intel(vendor: u16, device: u16) -> bool {
+    vendor == 0x8086 && OLD_INTEL.contains(&device)
+}
+
+/// Whether an app inside a display server may draw on the GPU, with a
+/// context on no surface: not on a machine whose graphics chip is an old
+/// Intel one (see [`OLD_INTEL`]), where Shine's own CPU drawing is what
+/// works. `SHINE_GPU_DRAW=1` asks for the GPU all the same.
+#[cfg(target_os = "linux")]
+pub(crate) fn headless_trusted() -> bool {
+    if drawing_forced() {
+        return true;
+    }
+    let Ok(devices) = std::fs::read_dir("/sys/bus/pci/devices") else {
+        return true;
+    };
+    let hex = |text: String| u16::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
+    for entry in devices.flatten() {
+        let read = |file: &str| std::fs::read_to_string(entry.path().join(file)).unwrap_or_default();
+        if !read("class").trim().starts_with("0x03") {
+            continue;
+        }
+        if let (Some(vendor), Some(device)) = (hex(read("vendor")), hex(read("device")))
+            && old_intel(vendor, device)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Have the programs this one starts draw on the CPU: what a display
+/// server says when it has no GPU to draw on itself, so that each app
+/// does not go looking for one (and find Mesa's software renderer, or a
+/// driver that does not work). An environment that already says which
+/// way to draw is left as it is.
+#[cfg(target_os = "linux")]
+pub(crate) fn children_draw_on_cpu() {
+    if std::env::var_os("SHINE_GPU_DRAW").is_none() {
+        // SAFETY: set as the console opens, on the thread that draws,
+        // before the program has started anything of its own; nothing
+        // else in Shine writes the environment then.
+        unsafe { std::env::set_var("SHINE_GPU_DRAW", "0") };
+    }
 }
 
 /// Whether the OpenGL a device described as `description` gives is Mesa
@@ -203,14 +309,23 @@ fn mode_number(blend: BlendMode) -> f32 {
     }
 }
 
-/// Draw `blit` of `src` onto `dst`, blending over what is there.
-pub(crate) fn blit(dst: &Texture, src: &Texture, blit: &Blit) {
+/// Draw `blit` of `src` onto `dst`, blending over what is there. `false`,
+/// with nothing drawn, on a GPU that cannot run the shader this one needs.
+pub(crate) fn blit(dst: &Texture, src: &Texture, blit: &Blit) -> bool {
     let dev = &dst.dev;
     let gl = &dev.gl;
-    let p = &dev.blit;
     let (sx, sy, sw, sh) = blit.sub;
     let t = &blit.xform;
     let radius = blit.corner_radius.min(sw / 2.0).min(sh / 2.0).max(0.0);
+    let Some(p) = dev.blit_program(BlitKey {
+        mode: shader_mode(blit.blend),
+        check_inside: blit.check_inside,
+        rounded: radius > 0.0,
+        nearest: !blit.linear,
+        opaque: blit.opaque,
+    }) else {
+        return false;
+    };
     dst.bind_target();
     blit.clip.apply(gl);
     blend_state(gl, blit.blend);
@@ -232,14 +347,23 @@ pub(crate) fn blit(dst: &Texture, src: &Texture, blit: &Blit) {
         let [r, g, b, a] = blit.tint;
         gl.uniform_4_f32(p.tint.as_ref(), b, g, r, a);
         gl.uniform_1_f32(p.radius.as_ref(), radius as f32);
-        gl.uniform_1_f32(p.filtered.as_ref(), if blit.linear { 1.0 } else { 0.0 });
-        gl.uniform_1_f32(p.check_inside.as_ref(), if blit.check_inside { 1.0 } else { 0.0 });
-        gl.uniform_1_f32(p.opaque.as_ref(), if blit.opaque { 1.0 } else { 0.0 });
-        gl.uniform_1_f32(p.mode.as_ref(), mode_number(blit.blend));
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(src.texture));
         dev.bind_quad();
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    }
+    true
+}
+
+/// The mode a shape or glyph shader is compiled with: what an image's is
+/// (`program::shader_mode`), but a colour has nothing weighed in it
+/// already, so replace and premultiplied are given the same as screen:
+/// the colour times how much of it.
+fn fill_mode(blend: BlendMode) -> u8 {
+    match shader_mode(blend) {
+        0 => 0,
+        3 => 3,
+        _ => 4,
     }
 }
 
@@ -309,8 +433,9 @@ pub(crate) fn can_fill(blend: BlendMode) -> bool {
 
 /// Fill `cover` onto `dst` with `fill`'s paint. A rectangle or a kept
 /// shape in a flat colour joins the batch (see `batch`); the rest are drawn
-/// at once.
-pub(crate) fn fill(dst: &Texture, fill: &Fill, cover: Cover) {
+/// at once. `false`, with nothing drawn, on a GPU that cannot run the
+/// shader this one needs.
+pub(crate) fn fill(dst: &Texture, fill: &Fill, cover: Cover) -> bool {
     if fill.gradient.is_none() {
         let Clip { x0, y0, x1, y1 } = fill.area;
         let area = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
@@ -333,12 +458,23 @@ pub(crate) fn fill(dst: &Texture, fill: &Fill, cover: Cover) {
         };
         if let Some(quad) = quad {
             batch::add(dst, fill.blend, &quad);
-            return;
+            return true;
         }
     }
     let dev = &dst.dev;
     let gl = &dev.gl;
-    let p = &dev.shape;
+    let Some(p) = dev.shape_program(ShapeKey {
+        mode: fill_mode(fill.blend),
+        from_mask: !matches!(cover, Cover::Rect(..)),
+        hard: !fill.antialias,
+        gradient: match fill.gradient.as_ref().map(|gradient| gradient.kind) {
+            None => 0,
+            Some(GradientKind::Linear { .. }) => 1,
+            Some(GradientKind::Radial { .. }) => 2,
+        },
+    }) else {
+        return false;
+    };
     dst.bind_target();
     fill.area.apply(gl);
     blend_state(gl, fill.blend);
@@ -348,36 +484,54 @@ pub(crate) fn fill(dst: &Texture, fill: &Fill, cover: Cover) {
         gl.uniform_2_f32(p.target.as_ref(), dst.w as f32, dst.h as f32);
         let Clip { x0, y0, x1, y1 } = fill.area;
         gl.uniform_4_f32(p.area.as_ref(), x0 as f32, y0 as f32, x1 as f32, y1 as f32);
-        gl.uniform_1_f32(p.antialias.as_ref(), if fill.antialias { 1.0 } else { 0.0 });
-        gl.uniform_1_f32(p.mode.as_ref(), mode_number(fill.blend));
         let swap = |c: [f32; 4]| [c[2], c[1], c[0], c[3]];
         let [r, g, b, a] = swap(fill.colour);
         gl.uniform_4_f32(p.colour.as_ref(), r, g, b, a);
-        match &fill.gradient {
-            None => gl.uniform_1_f32(p.gradient.as_ref(), 0.0),
-            Some(gradient) => {
-                let (kind, geometry) = match gradient.kind {
-                    GradientKind::Linear { x0, y0, x1, y1 } => (1.0, [x0, y0, x1, y1]),
-                    GradientKind::Radial { cx, cy, radius } => (2.0, [cx, cy, radius, 0.0]),
-                };
-                gl.uniform_1_f32(p.gradient.as_ref(), kind);
-                let [a, b, c, d] = geometry.map(|v| v as f32);
-                gl.uniform_4_f32(p.geometry.as_ref(), a, b, c, d);
-                let stops = gradient.stops();
-                let mut colours = [0.0f32; 32];
-                let mut at = [0.0f32; 8];
-                for (i, stop) in stops.iter().enumerate().take(8) {
-                    colours[i * 4..i * 4 + 4].copy_from_slice(&swap(stop.color));
-                    at[i] = stop.at;
+        if let Some(gradient) = &fill.gradient {
+            // Where along it a pixel is, with the dividing done here (see
+            // the shader): nowhere along a line with no length, at the
+            // end of a circle with no radius, as the CPU has them.
+            let ramp = match gradient.kind {
+                GradientKind::Linear { x0, y0, x1, y1 } => {
+                    let (ax, ay) = (x1 - x0, y1 - y0);
+                    let length2 = ax * ax + ay * ay;
+                    if length2 <= 1e-12 {
+                        [0.0; 4]
+                    } else {
+                        let (gx, gy) = (ax / length2, ay / length2);
+                        [gx, gy, -(x0 * gx + y0 * gy), 0.0]
+                    }
                 }
-                gl.uniform_4_f32_slice(p.stop_colour.as_ref(), &colours);
-                gl.uniform_1_f32_slice(p.stop_at.as_ref(), &at);
-                gl.uniform_1_f32(p.stop_count.as_ref(), stops.len() as f32);
+                GradientKind::Radial { cx, cy, radius } if radius.abs() <= 1e-12 => {
+                    [cx, cy, 0.0, 1.0]
+                }
+                GradientKind::Radial { cx, cy, radius } => [cx, cy, 1.0 / radius, 0.0],
+            };
+            let [a, b, c, d] = ramp.map(|v| v as f32);
+            gl.uniform_4_f32(p.ramp.as_ref(), a, b, c, d);
+            // Eight stops, the last one there is standing in for the ones
+            // there are not; and for each, one over how far it is from
+            // the stop before: all of the way at once for two stops in
+            // one place, none of it for a stop that is not there.
+            let stops = gradient.stops();
+            let mut colours = [0.0f32; 32];
+            let mut at = [0.0f32; 8];
+            let mut scale = [0.0f32; 8];
+            for i in 0..8 {
+                let stop = &stops[i.min(stops.len().saturating_sub(1))];
+                colours[i * 4..i * 4 + 4].copy_from_slice(&swap(stop.color));
+                at[i] = stop.at;
+                if i >= 1 && i < stops.len() {
+                    let span = at[i] - at[i - 1];
+                    scale[i] = if span <= 1.192_092_9e-7 { 1e9 } else { 1.0 / span };
+                }
             }
+            gl.uniform_4_f32_slice(p.stop_colour.as_ref(), &colours);
+            gl.uniform_1_f32_slice(p.stop_at.as_ref(), &at);
+            gl.uniform_1_f32_slice(p.stop_scale.as_ref(), &scale);
         }
         match cover {
             Cover::Rect(rx0, ry0, rx1, ry1) => {
-                gl.uniform_1_f32(p.from_mask.as_ref(), 0.0);
                 gl.uniform_4_f32(p.rect.as_ref(), rx0 as f32, ry0 as f32, rx1 as f32, ry1 as f32);
             }
             Cover::Mask {
@@ -386,7 +540,6 @@ pub(crate) fn fill(dst: &Texture, fill: &Fill, cover: Cover) {
                 bytes,
             } => {
                 let (cw, ch) = upload_mask(dev, size, bytes);
-                gl.uniform_1_f32(p.from_mask.as_ref(), 1.0);
                 gl.uniform_2_f32(p.mask_origin.as_ref(), origin.0 as f32, origin.1 as f32);
                 gl.uniform_2_f32(p.mask_corner.as_ref(), 0.0, 0.0);
                 gl.uniform_2_f32(p.mask_scale.as_ref(), 1.0 / cw as f32, 1.0 / ch as f32);
@@ -396,7 +549,6 @@ pub(crate) fn fill(dst: &Texture, fill: &Fill, cover: Cover) {
                 gl.active_texture(glow::TEXTURE1);
                 gl.bind_texture(glow::TEXTURE_2D, Some(shapes.texture));
                 let size = shapes.size as f32;
-                gl.uniform_1_f32(p.from_mask.as_ref(), 1.0);
                 gl.uniform_2_f32(p.mask_origin.as_ref(), origin.0 as f32, origin.1 as f32);
                 gl.uniform_2_f32(p.mask_corner.as_ref(), corner.0 as f32, corner.1 as f32);
                 gl.uniform_2_f32(p.mask_scale.as_ref(), 1.0 / size, 1.0 / size);
@@ -406,6 +558,7 @@ pub(crate) fn fill(dst: &Texture, fill: &Fill, cover: Cover) {
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         gl.active_texture(glow::TEXTURE0);
     }
+    true
 }
 
 /// Put a coverage mask in the device's mask texture, at its corner, and
@@ -533,18 +686,26 @@ pub(crate) fn draw_glyphs(dst: &Texture, paint: &TextPaint, glyphs: &[GlyphDraw]
     let atlas_size = dev.atlas.borrow().size as f32;
     let atlas_texture = dev.atlas.borrow().texture;
 
-    let p = &dev.glyph;
+    // The shaders the run needs, before anything is changed: one for
+    // glyphs at whole-pixel places, one for the scaled and turned.
+    let mode = fill_mode(paint.blend);
+    let Some(exact_program) = dev.glyph_program(TextKey { mode, sampling: GlyphSampling::Exact })
+    else {
+        return false;
+    };
+    let sampling = if paint.linear { GlyphSampling::Filtered } else { GlyphSampling::Nearest };
+    let any_turned = glyphs.iter().any(|g| crate::raster::axis_aligned_offset(&g.xform).is_none());
+    let turned_program = match any_turned {
+        true => match dev.glyph_program(TextKey { mode, sampling }) {
+            Some(program) => Some(program),
+            None => return false,
+        },
+        false => None,
+    };
     dst.bind_target();
     blend_state(gl, paint.blend);
     // SAFETY: GL calls on the device's current context.
     unsafe {
-        gl.use_program(Some(p.program));
-        gl.uniform_2_f32(p.target.as_ref(), dst.w as f32, dst.h as f32);
-        gl.uniform_1_f32(p.atlas_scale.as_ref(), 1.0 / atlas_size);
-        let [r, g, b, a] = paint.colour;
-        gl.uniform_4_f32(p.colour.as_ref(), b, g, r, a);
-        gl.uniform_1_f32(p.mode.as_ref(), mode_number(paint.blend));
-        gl.uniform_1_f32(p.filtered.as_ref(), if paint.linear { 1.0 } else { 0.0 });
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, Some(atlas_texture));
         gl.active_texture(glow::TEXTURE0);
@@ -554,6 +715,16 @@ pub(crate) fn draw_glyphs(dst: &Texture, paint: &TextPaint, glyphs: &[GlyphDraw]
             gl.vertex_attrib_pointer_f32(location, size, glow::FLOAT, false, 32, offset);
         }
     }
+    let begin = |p: &GlyphProgram| {
+        // SAFETY: as above.
+        unsafe {
+            gl.use_program(Some(p.program));
+            gl.uniform_2_f32(p.target.as_ref(), dst.w as f32, dst.h as f32);
+            gl.uniform_1_f32(p.atlas_scale.as_ref(), 1.0 / atlas_size);
+            let [r, g, b, a] = paint.colour;
+            gl.uniform_4_f32(p.colour.as_ref(), b, g, r, a);
+        }
+    };
 
     // Whole-pixel glyphs: two triangles each, all in one draw.
     let mut exact: Vec<f32> = Vec::new();
@@ -576,9 +747,9 @@ pub(crate) fn draw_glyphs(dst: &Texture, paint: &TextPaint, glyphs: &[GlyphDraw]
     }
     if !exact.is_empty() {
         paint.clip.apply(gl);
+        begin(&exact_program);
         // SAFETY: as above.
         unsafe {
-            gl.uniform_1_f32(p.exact.as_ref(), 1.0);
             gl.buffer_data_u8_slice(
                 glow::ARRAY_BUFFER,
                 device::bytes_of(&exact),
@@ -591,6 +762,9 @@ pub(crate) fn draw_glyphs(dst: &Texture, paint: &TextPaint, glyphs: &[GlyphDraw]
     // A scaled or turned glyph: the pixels the CPU visits are those of its
     // box on the target, so that is the scissor, and the square drawn is
     // grown past the glyph by a pixel so none of them is missed.
+    if let Some(program) = &turned_program {
+        begin(program);
+    }
     for (g, cell) in turned {
         let t = &g.xform;
         let bounds = crate::raster::transformed_bounds(t, g.w as f64, g.h as f64);
@@ -626,7 +800,6 @@ pub(crate) fn draw_glyphs(dst: &Texture, paint: &TextPaint, glyphs: &[GlyphDraw]
         clip.apply(gl);
         // SAFETY: as above.
         unsafe {
-            gl.uniform_1_f32(p.exact.as_ref(), 0.0);
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, device::bytes_of(&quad), glow::STREAM_DRAW);
             gl.draw_arrays(glow::TRIANGLES, 0, 6);
         }
@@ -675,7 +848,17 @@ pub(crate) fn tracing() -> bool {
 
 #[cfg(test)]
 mod software_tests {
-    use super::software_renderer;
+    use super::{old_intel, software_renderer};
+
+    #[test]
+    fn old_intel_chips_are_known_by_their_ids() {
+        // The netbook's GMA 3150, and a 945GM.
+        assert!(old_intel(0x8086, 0xa011));
+        assert!(old_intel(0x8086, 0x27a2));
+        // Skylake's HD Graphics 530; an NVIDIA card with a like id.
+        assert!(!old_intel(0x8086, 0x191b));
+        assert!(!old_intel(0x10de, 0xa011));
+    }
 
     #[test]
     fn mesa_on_the_cpu_is_told_from_a_gpu() {

@@ -17,17 +17,21 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use super::atlas::Atlas;
 use super::program::{
-    BlitProgram, BlurProgram, FillBatchProgram, GlyphProgram, PresentProgram, ShapeProgram,
+    BlitKey, BlitProgram, FillBatchProgram, TextKey, GlyphProgram, GlyphSampling,
+    PresentProgram, ShapeKey, ShapeProgram, Variants,
 };
 
 pub(crate) struct Device {
     pub(crate) gl: glow::Context,
     pub(crate) present: PresentProgram,
-    pub(crate) blit: BlitProgram,
-    pub(crate) shape: ShapeProgram,
-    pub(crate) glyph: GlyphProgram,
+    /// The shaders that come in variants, each made when a draw first
+    /// needs it (see `program::link_variant`).
+    blit_programs: Variants<BlitKey, BlitProgram>,
+    shape_programs: Variants<ShapeKey, ShapeProgram>,
+    glyph_programs: Variants<TextKey, GlyphProgram>,
     pub(crate) fill_batch: FillBatchProgram,
-    pub(crate) blur: BlurProgram,
+    /// OpenGL ES, not desktop OpenGL: which header the shaders get.
+    es: bool,
     /// Shapes gathered to be drawn together (see `gpu::batch`).
     pub(crate) batch: super::batch::Pending,
     /// Every glyph drawn so far (see `gpu::atlas`).
@@ -58,6 +62,13 @@ pub(crate) struct Device {
     /// "OpenGL ES 3.1 Mesa … · D3D12 (AMD Radeon RX 6700 XT)".
     pub(crate) description: String,
 }
+
+/// The plainest variant of each shader: an image as it is, a rectangle in
+/// one colour, text at a whole-pixel place, all blended over what is there.
+const PLAIN_BLIT: BlitKey =
+    BlitKey { mode: 0, check_inside: false, rounded: false, nearest: false, opaque: false };
+const PLAIN_SHAPE: ShapeKey = ShapeKey { mode: 0, from_mask: false, hard: false, gradient: 0 };
+const PLAIN_GLYPH: TextKey = TextKey { mode: 0, sampling: GlyphSampling::Exact };
 
 impl Device {
     /// A context on `window`, `width` × `height` drawable pixels; an error
@@ -233,6 +244,30 @@ impl Device {
         )
     }
 
+    /// OpenGL ES, not desktop OpenGL: which header a shader gets.
+    pub(crate) fn es(&self) -> bool {
+        self.es
+    }
+
+    /// The blit shader for `key`: none where the GPU cannot run that
+    /// one, and the draw is the CPU's.
+    pub(crate) fn blit_program(&self, key: BlitKey) -> Option<std::rc::Rc<BlitProgram>> {
+        // SAFETY: GL calls on this device's current context.
+        self.blit_programs.get(key, || unsafe { BlitProgram::new(&self.gl, self.es, key) })
+    }
+
+    /// The shape shader for `key`, likewise.
+    pub(crate) fn shape_program(&self, key: ShapeKey) -> Option<std::rc::Rc<ShapeProgram>> {
+        // SAFETY: as above.
+        self.shape_programs.get(key, || unsafe { ShapeProgram::new(&self.gl, self.es, key) })
+    }
+
+    /// The glyph shader for `key`, likewise.
+    pub(crate) fn glyph_program(&self, key: TextKey) -> Option<std::rc::Rc<GlyphProgram>> {
+        // SAFETY: as above.
+        self.glyph_programs.get(key, || unsafe { GlyphProgram::new(&self.gl, self.es, key) })
+    }
+
     /// The programs and buffers every device has, on a current context.
     fn finish(
         display: Display,
@@ -253,12 +288,45 @@ impl Device {
 
         // SAFETY: GL calls on the current context.
         unsafe {
-            let present = PresentProgram::new(&gl, es)?;
-            let blit = BlitProgram::new(&gl, es)?;
-            let shape = ShapeProgram::new(&gl, es)?;
-            let glyph = GlyphProgram::new(&gl, es)?;
-            let fill_batch = FillBatchProgram::new(&gl, es)?;
-            let blur = BlurProgram::new(&gl, es)?;
+            // Every program is tried before any failure is reported: a
+            // chip that cannot run one usually cannot run several, and
+            // which ones, and how far over its limits each is (the driver
+            // says), is what there is to go on when no such chip is at
+            // hand.
+            //
+            // The three that come in variants are tried in their plainest
+            // one: a GPU that cannot run that cannot draw a window. The
+            // rest are made as draws need them.
+            let present = PresentProgram::new(&gl, es);
+            let blit = BlitProgram::new(&gl, es, PLAIN_BLIT);
+            let shape = ShapeProgram::new(&gl, es, PLAIN_SHAPE);
+            let glyph = GlyphProgram::new(&gl, es, PLAIN_GLYPH);
+            let fill_batch = FillBatchProgram::new(&gl, es);
+            let failed: Vec<String> = [
+                ("present", present.as_ref().err()),
+                ("blit", blit.as_ref().err()),
+                ("shape", shape.as_ref().err()),
+                ("glyph", glyph.as_ref().err()),
+                ("fill", fill_batch.as_ref().err()),
+            ]
+            .into_iter()
+            .filter_map(|(name, error)| error.map(|e| format!("{name}: {}", e.trim())))
+            .collect();
+            if !failed.is_empty() {
+                return Err(format!(
+                    "{} cannot run {} of Shine's 5 shaders ({})",
+                    gl.get_parameter_string(glow::RENDERER),
+                    failed.len(),
+                    failed.join("; ")
+                ));
+            }
+            let (present, fill_batch) = (present?, fill_batch?);
+            let blit_programs = Variants::new();
+            let shape_programs = Variants::new();
+            let glyph_programs = Variants::new();
+            blit_programs.get(PLAIN_BLIT, || blit);
+            shape_programs.get(PLAIN_SHAPE, || shape);
+            glyph_programs.get(PLAIN_GLYPH, || glyph);
             let atlas = RefCell::new(Atlas::new(&gl)?);
             let shapes = RefCell::new(Atlas::new(&gl)?);
             let stream = gl.create_buffer().map_err(|e| format!("GL buffer: {e}"))?;
@@ -276,11 +344,11 @@ impl Device {
             Ok(Device {
                 gl,
                 present,
-                blit,
-                shape,
-                glyph,
+                blit_programs,
+                shape_programs,
+                glyph_programs,
                 fill_batch,
-                blur,
+                es,
                 batch: Default::default(),
                 atlas,
                 shapes,
@@ -361,11 +429,16 @@ impl Drop for Device {
         unsafe {
             self.gl.delete_buffer(self.quad);
             self.gl.delete_program(self.present.program);
-            self.gl.delete_program(self.blit.program);
-            self.gl.delete_program(self.shape.program);
-            self.gl.delete_program(self.glyph.program);
+            for program in self.blit_programs.programs() {
+                self.gl.delete_program(program.program);
+            }
+            for program in self.shape_programs.programs() {
+                self.gl.delete_program(program.program);
+            }
+            for program in self.glyph_programs.programs() {
+                self.gl.delete_program(program.program);
+            }
             self.gl.delete_program(self.fill_batch.program);
-            self.gl.delete_program(self.blur.program);
             self.gl.delete_buffer(self.stream);
             self.atlas.borrow().delete(&self.gl);
             self.shapes.borrow().delete(&self.gl);

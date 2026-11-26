@@ -230,6 +230,42 @@ impl Font {
 }
 
 // ---------------------------------------------------------------------------
+// Shader
+// ---------------------------------------------------------------------------
+
+/// An effect of the program's own, run by the graphics chip for every
+/// pixel an image is drawn to while it is set (`Graphics.setShader`). See
+/// `Graphics.newShader`.
+#[saule_class]
+pub struct Shader {
+    pub(crate) handle: i64,
+}
+
+impl Drop for Shader {
+    fn drop(&mut self) {
+        state::release_later(Res::Shader(self.handle));
+    }
+}
+
+#[saule_methods]
+impl Shader {
+    /// Set the shader's `uniform` called `name`: a `float`, or a `vec2`,
+    /// `vec3` or `vec4` with that many numbers.
+    pub fn send(
+        &self,
+        name: &str,
+        x: f64,
+        y: Option<f64>,
+        z: Option<f64>,
+        w: Option<f64>,
+    ) -> Result<(), String> {
+        let value: Vec<f32> =
+            [Some(x), y, z, w].into_iter().map_while(|v| v).map(|v| v as f32).collect();
+        state::draw(|gfx| gfx.shader_send(self.handle, name, &value))?
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Quad
 // ---------------------------------------------------------------------------
 
@@ -335,6 +371,78 @@ fn graphics_new_canvas(width: i64, height: i64) -> Result<Canvas, String> {
         w: width,
         h: height,
     })
+}
+
+thread_local! {
+    /// Why the last `Graphics.newShader` gave nothing.
+    static SHADER_PROBLEM: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The shader images are drawn through, kept while it is.
+    static SHADER: RefCell<Option<SObject<Shader>>> = const { RefCell::new(None) };
+}
+
+/// `Graphics.newShader(source)` — an effect written in GLSL ES 1.00, as
+/// one function:
+///
+/// ```glsl
+/// vec4 effect(vec4 colour, sampler2D image, vec2 uv, vec2 pixel)
+/// ```
+///
+/// called for every pixel an image is drawn to while the shader is set:
+/// `colour` the paint colour, `image` the image, `uv` where in it the
+/// pixel reads (0 to 1) and `pixel` the same in its own pixels. It
+/// returns the pixel's colour, blended as the image's would be.
+/// `Texel(image, uv)` reads the image, `texel` is one of its pixels in
+/// `uv`, and uniforms it declares are set with `Shader.send`.
+///
+/// `nil` where there is no shader to be had, and `getShaderProblem` says
+/// why: the processor is drawing, or the graphics chip turned the source
+/// down (its complaint, with the source's line numbers). A program that
+/// asks for an effect draws without it then.
+#[saule_export(class = "Graphics", name = "newShader")]
+fn graphics_new_shader(source: String) -> Result<Option<Shader>, String> {
+    match state::draw(|gfx| gfx.new_shader(&source))? {
+        Ok(handle) => {
+            SHADER_PROBLEM.with(|p| p.borrow_mut().clear());
+            Ok(Some(Shader { handle }))
+        }
+        Err(why) => {
+            SHADER_PROBLEM.with(|p| *p.borrow_mut() = why);
+            Ok(None)
+        }
+    }
+}
+
+/// `Graphics.getShaderProblem()` — why the last `newShader` returned
+/// `nil`; "" when it did not.
+#[saule_export(class = "Graphics", name = "getShaderProblem")]
+fn graphics_get_shader_problem() -> String {
+    SHADER_PROBLEM.with(|p| p.borrow().clone())
+}
+
+/// `Graphics.setShader([shader])` — draw images through `shader` from now
+/// on; with no argument, as they are. Shapes and text are not changed by
+/// it, and it is not part of what `push("all")` saves.
+#[saule_export(class = "Graphics", name = "setShader")]
+fn graphics_set_shader(shader: Option<SObject<Shader>>) -> Result<(), String> {
+    let handle = match &shader {
+        Some(s) => Some(s.borrow()?.handle),
+        None => None,
+    };
+    state::draw(|gfx| gfx.set_shader(handle))??;
+    SHADER.with(|s| *s.borrow_mut() = shader);
+    Ok(())
+}
+
+/// `Graphics.capture(canvas, x, y, width, height)` — copy what is on the
+/// target (the screen, or the canvas being drawn into) under that
+/// rectangle into `canvas`, made to fit it: into a smaller canvas, each
+/// pixel is a mix of the ones it stands for. What an effect over what is
+/// already drawn starts from: a frosted panel captures what is behind it,
+/// blurs that, and draws it back.
+#[saule_export(class = "Graphics", name = "capture")]
+fn graphics_capture(canvas: SObject<Canvas>, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
+    let handle = canvas.borrow()?.handle;
+    state::draw(|gfx| gfx.capture(handle, x, y, width, height))?
 }
 
 /// `Graphics.newFont(size [, path])` — a TrueType face at `size`. Without a

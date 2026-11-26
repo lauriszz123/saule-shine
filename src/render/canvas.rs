@@ -249,6 +249,11 @@ impl Renderer {
             .then(&Transform::translation(-ox, -oy));
         let xform = self.st.transform.then(&local);
 
+        // Through the program's own shader, when one is set.
+        if let Some(shader) = self.shader {
+            return self.shader_blit(shader, idx, frame, &xform, &paint);
+        }
+
         if self.gpu_blit(idx, frame, &xform, &paint) {
             return Ok(());
         }

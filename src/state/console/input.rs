@@ -32,11 +32,12 @@ use std::time::{Duration, Instant};
 use minifb::{InputCallback, Key};
 
 use super::keymap;
-use super::touchpad::{self, Moves, Touch};
+use super::touchpad::{self, Pad, Shape, Tap};
 use crate::devices::{self, Found, Kind};
 use crate::keyboard::TextCollector;
 use crate::layout::{self, Typed};
 
+const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
 const EV_ABS: u16 = 0x03;
@@ -45,9 +46,22 @@ const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
+/// A wheel in 120ths of a notch: every wheel says this as well as whole
+/// notches, and one that turns smoothly says it between them.
+const REL_WHEEL_HI_RES: u16 = 0x0b;
+const REL_HWHEEL_HI_RES: u16 = 0x0c;
 
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
+const ABS_MT_SLOT: u16 = 0x2f;
+const ABS_MT_POSITION_X: u16 = 0x35;
+const ABS_MT_POSITION_Y: u16 = 0x36;
+
+/// What a device says of itself (`EVIOCGPROP`): that the whole of a
+/// touchpad presses down as its button, and that its slots hold a box
+/// round two fingers and not the fingers.
+const INPUT_PROP_BUTTONPAD: u16 = 0x02;
+const INPUT_PROP_SEMI_MT: u16 = 0x03;
 
 const KEY_ENTER: u16 = 28;
 const KEY_A: u16 = 30;
@@ -103,6 +117,11 @@ const EVIOCGID: c_ulong = (2 << 30) | (8 << 16) | ((b'E' as c_ulong) << 8) | 0x0
 /// What is plugged in comes by USB or Bluetooth.
 const BUILT_IN_BUSES: [u16; 5] = [0x10, 0x11, 0x18, 0x19, 0x1c];
 
+/// `EVIOCGPROP(len)`: the device's properties, a bit each.
+fn eviocgprop(len: usize) -> c_ulong {
+    (2 << 30) | ((len as c_ulong) << 16) | (0x45 << 8) | 0x09
+}
+
 fn eviocgabs(axis: u16) -> c_ulong {
     (2 << 30) | (24 << 16) | (0x45 << 8) | (0x40 + axis as c_ulong)
 }
@@ -135,15 +154,18 @@ struct Device {
     /// What it is, for [`crate::devices`]: `None` for the buttons on the
     /// case, the lid and the like, which nothing is set on.
     found: Option<Found>,
-    /// Touchpads: where the finger was at the last event while touching.
-    finger: Option<(i32, i32)>,
     /// The absolute position this frame's events are building up.
     abs: (Option<i32>, Option<i32>),
     touching: bool,
-    /// Touchpads: the gesture under way.
-    touch: Touch,
+    /// Touchpads: the fingers on it, and what they come to.
+    pad: Option<Pad>,
     /// Touchpads: the button a press of the pad itself went down as.
     pad_button: usize,
+    /// Mice: how far this report has moved it so far, when the report
+    /// before ended, and whether its wheel says parts of a notch.
+    rel: (i32, i32),
+    moved_at: Option<f64>,
+    fine_wheel: bool,
 }
 
 impl Device {
@@ -158,6 +180,7 @@ impl Device {
         let mut abs_bits = [0u8; 8];
         let mut key_bits = [0u8; 96];
         let mut rel_bits = [0u8; 2];
+        let mut prop_bits = [0u8; 8];
         let mut name = [0u8; 128];
         let mut id = [0u16; 4];
         // Safety: each request writes at most the length encoded in it into
@@ -166,23 +189,43 @@ impl Device {
             libc::ioctl(fd, eviocgbit(EV_ABS, abs_bits.len()), abs_bits.as_mut_ptr());
             libc::ioctl(fd, eviocgbit(EV_KEY, key_bits.len()), key_bits.as_mut_ptr());
             libc::ioctl(fd, eviocgbit(EV_REL, rel_bits.len()), rel_bits.as_mut_ptr());
+            libc::ioctl(fd, eviocgprop(prop_bits.len()), prop_bits.as_mut_ptr());
             libc::ioctl(fd, eviocgname(name.len() - 1), name.as_mut_ptr());
             libc::ioctl(fd, EVIOCGID, id.as_mut_ptr());
         }
         let has = |bits: &[u8], code: u16| bits[code as usize / 8] & (1 << (code % 8)) != 0;
 
+        let mut pad = None;
         let pointer = if has(&abs_bits, ABS_X) && has(&abs_bits, ABS_Y) {
-            let range = |axis| {
+            // An axis's least and most, and its units a millimetre.
+            let axis = |axis| {
                 let mut info = AbsInfo::default();
                 // Safety: writes one `input_absinfo`, which `AbsInfo` mirrors.
                 unsafe { libc::ioctl(fd, eviocgabs(axis), &mut info) };
-                (info.minimum, info.maximum.max(info.minimum + 1))
+                ((info.minimum, info.maximum.max(info.minimum + 1)), info.resolution)
             };
-            let (x, y) = (range(ABS_X), range(ABS_Y));
             if has(&key_bits, BTN_TOOL_FINGER) {
-                Pointer::Touchpad { x, y }
+                // Each finger by itself where the pad says so (slots);
+                // their axes may differ from the one position's.
+                let slots = [ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y]
+                    .iter()
+                    .all(|&code| has(&abs_bits, code));
+                let (across, down) = if slots {
+                    (axis(ABS_MT_POSITION_X), axis(ABS_MT_POSITION_Y))
+                } else {
+                    (axis(ABS_X), axis(ABS_Y))
+                };
+                pad = Some(Pad::new(Shape {
+                    x: across.0,
+                    y: down.0,
+                    resolution: (across.1, down.1),
+                    buttonpad: has(&prop_bits, INPUT_PROP_BUTTONPAD),
+                    slots,
+                    semi: has(&prop_bits, INPUT_PROP_SEMI_MT),
+                }));
+                Pointer::Touchpad { x: across.0, y: down.0 }
             } else {
-                Pointer::Absolute { x, y }
+                Pointer::Absolute { x: axis(ABS_X).0, y: axis(ABS_Y).0 }
             }
         } else {
             Pointer::Relative
@@ -219,11 +262,13 @@ impl Device {
             file,
             pointer,
             found,
-            finger: None,
             abs: (None, None),
             touching: false,
-            touch: Touch::default(),
+            pad,
             pad_button: 0,
+            rel: (0, 0),
+            moved_at: None,
+            fine_wheel: has(&rel_bits, REL_WHEEL_HI_RES),
         })
     }
 }
@@ -231,6 +276,9 @@ impl Device {
 pub(super) struct Input {
     devices: Vec<Device>,
     last_scan: Instant,
+    /// When input was last taken in: how long a scroll that is carrying
+    /// on has carried on since.
+    last_pump: Instant,
     /// The screen size: the pointer stays inside it.
     bounds: (f64, f64),
     pub(super) pos: (f64, f64),
@@ -247,6 +295,9 @@ pub(super) struct Input {
     caps: bool,
     /// A tap on a touchpad: the button it is holding down, and until when.
     tap: Option<(usize, Instant)>,
+    /// A touch straight after a tap, dragging: whether the primary button
+    /// has gone down for it yet (it waits for the tap's click to end).
+    drag: Option<bool>,
     /// When a key was last pressed: a tap straight after is a hand
     /// brushing the pad.
     typed: Option<Instant>,
@@ -258,6 +309,7 @@ impl Input {
         let mut input = Input {
             devices: Vec::new(),
             last_scan: Instant::now(),
+            last_pump: Instant::now(),
             bounds,
             // The pointer starts in the middle of the screen.
             pos: (bounds.0 / 2.0, bounds.1 / 2.0),
@@ -270,6 +322,7 @@ impl Input {
             alt: [false; 2],
             caps: false,
             tap: None,
+            drag: None,
             typed: None,
         };
         input.scan();
@@ -319,6 +372,10 @@ impl Input {
         {
             self.buttons[button] = false;
             self.tap = None;
+        } else if self.drag == Some(false) && self.tap.is_none() {
+            // The frame after: two taps are two clicks, not a long one.
+            self.buttons[0] = true;
+            self.drag = Some(true);
         }
 
         let mut events = Vec::new();
@@ -330,10 +387,17 @@ impl Input {
                     Ok(0) => break,
                     Ok(n) => {
                         for raw in buf[..n].chunks_exact(EVENT_SIZE) {
+                            // When the kernel had it, in seconds: a
+                            // touchpad's reports are timed by it, however
+                            // late they are read.
+                            let whole = |at: usize| {
+                                i64::from_ne_bytes(raw[at..at + 8].try_into().expect("eight bytes"))
+                            };
+                            let at = whole(0) as f64 + whole(8) as f64 / 1e6;
                             let kind = u16::from_ne_bytes([raw[16], raw[17]]);
                             let code = u16::from_ne_bytes([raw[18], raw[19]]);
                             let value = i32::from_ne_bytes([raw[20], raw[21], raw[22], raw[23]]);
-                            events.push((i, kind, code, value));
+                            events.push((i, kind, code, value, at));
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -346,11 +410,33 @@ impl Input {
                 }
             }
         }
-        for (device, kind, code, value) in events {
-            self.event(device, kind, code, value);
+        for (device, kind, code, value, at) in events {
+            self.event(device, kind, code, value, at);
         }
-        // Absolute positions are applied once per device per pump, with
-        // whichever of X and Y moved.
+        // A scroll let go of while moving carries on, a frame's worth a
+        // frame, until it has run down or its pad is touched.
+        let since = self.last_pump.elapsed().as_secs_f64();
+        self.last_pump = Instant::now();
+        for device in &mut self.devices {
+            let Some(pad) = &mut device.pad else {
+                continue;
+            };
+            if !crate::pointer::coasts() {
+                pad.still();
+            }
+            let (across, down) = pad.coast(since);
+            if (across, down) != (0.0, 0.0) {
+                let (wx, wy) = crate::pointer::pad_wheel((
+                    across * touchpad::NOTCHES_A_PAD,
+                    -down * touchpad::NOTCHES_A_PAD,
+                ));
+                self.wheel_acc.0 += wx;
+                self.wheel_acc.1 += wy;
+            }
+        }
+        // A tablet's or a screen's position is applied once per device
+        // per pump, with whichever of X and Y moved. (A touchpad's is
+        // taken report by report as it is read: see `report`.)
         for i in 0..self.devices.len() {
             self.apply_absolute(i);
         }
@@ -365,24 +451,99 @@ impl Input {
         self.wheel_acc = (0.0, 0.0);
     }
 
-    fn event(&mut self, device: usize, kind: u16, code: u16, value: i32) {
+    fn event(&mut self, device: usize, kind: u16, code: u16, value: i32, at: f64) {
         match kind {
             EV_KEY => self.key(device, code, value),
+            // The end of one report (`SYN_REPORT`).
+            EV_SYN if code == 0 => self.report(device, at),
             EV_REL => match code {
-                REL_X => self.move_by(value as f64 * crate::pointer::speed(), 0.0),
-                REL_Y => self.move_by(0.0, value as f64 * crate::pointer::speed()),
-                // Positive is away from the user, as Shine reports it.
-                REL_WHEEL => self.wheel_acc.1 += value as f64,
-                REL_HWHEEL => self.wheel_acc.0 += value as f64,
+                // Moved at the report's end, by how fast that was.
+                REL_X => self.devices[device].rel.0 += value,
+                REL_Y => self.devices[device].rel.1 += value,
+                // Positive is away from the user, as Shine reports it. A
+                // wheel that says parts of a notch is heard by those.
+                REL_WHEEL if !self.devices[device].fine_wheel => self.wheel_acc.1 += value as f64,
+                REL_HWHEEL if !self.devices[device].fine_wheel => self.wheel_acc.0 += value as f64,
+                REL_WHEEL_HI_RES if self.devices[device].fine_wheel => {
+                    self.wheel_acc.1 += value as f64 / 120.0
+                }
+                REL_HWHEEL_HI_RES if self.devices[device].fine_wheel => {
+                    self.wheel_acc.0 += value as f64 / 120.0
+                }
                 _ => {}
             },
             EV_ABS => {
                 let d = &mut self.devices[device];
-                match code {
-                    ABS_X => d.abs.0 = Some(value),
-                    ABS_Y => d.abs.1 = Some(value),
+                match (&mut d.pad, code) {
+                    (Some(pad), _) => pad.axis(code, value),
+                    (None, ABS_X) => d.abs.0 = Some(value),
+                    (None, ABS_Y) => d.abs.1 = Some(value),
                     _ => {}
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// A touchpad's report has ended: move the pointer, or scroll, by
+    /// what its fingers did in it.
+    fn report(&mut self, device: usize, at: f64) {
+        let bounds = self.bounds;
+        let d = &mut self.devices[device];
+        let (dx, dy) = std::mem::take(&mut d.rel);
+        if (dx, dy) != (0, 0) {
+            // A mouse: further for the same movement made faster. Its
+            // reports come every millisecond to every hundredth of a
+            // second; one after a pause says nothing of how fast.
+            let took = d.moved_at.map_or(0.008, |before| (at - before).clamp(0.001, 0.03));
+            d.moved_at = Some(at);
+            let (dx, dy) = (dx as f64, dy as f64);
+            let quickened = if crate::pointer::quickens() {
+                crate::pointer::quickened(dx.hypot(dy) / took)
+            } else {
+                1.0
+            };
+            let by = crate::pointer::speed() * quickened;
+            self.move_by(dx * by, dy * by);
+        }
+        let d = &mut self.devices[device];
+        let (Some(pad), Pointer::Touchpad { x, y }) = (&mut d.pad, d.pointer) else {
+            return;
+        };
+        let moved = pad.report(at);
+        let dragging = pad.dragging();
+        if moved.pointer != (0.0, 0.0) {
+            // A slow sweep of the pad's width covers about the screen's,
+            // or as much of it as keeps the pad's own shape.
+            let (wide, high) = ((x.1 - x.0) as f64, (y.1 - y.0) as f64);
+            let reach = bounds.0.min(bounds.1 * wide / high) * crate::pointer::pad_speed();
+            self.move_by(moved.pointer.0 * reach, moved.pointer.1 * reach);
+        }
+        if moved.scroll != (0.0, 0.0) {
+            // As a wheel turns: fingers drawn toward the user are the
+            // wheel turned toward the user, which Shine counts as negative.
+            let (wx, wy) = crate::pointer::pad_wheel((
+                moved.scroll.0 * touchpad::NOTCHES_A_PAD,
+                -moved.scroll.1 * touchpad::NOTCHES_A_PAD,
+            ));
+            self.wheel_acc.0 += wx;
+            self.wheel_acc.1 += wy;
+        }
+        // A second finger made the drag a scroll.
+        if !dragging {
+            self.drag_ends();
+        }
+    }
+
+    /// The touch that held the button a tap clicked is over.
+    fn drag_ends(&mut self) {
+        match self.drag.take() {
+            Some(true) => self.buttons[0] = false,
+            // Over before its button went down: a click all the same,
+            // unless the tap's own is still going.
+            Some(false) if self.tap.is_none() => {
+                self.buttons[0] = true;
+                self.tap = Some((0, Instant::now() + TAP_HELD));
             }
             _ => {}
         }
@@ -409,41 +570,7 @@ impl Input {
                 }
                 self.clamp();
             }
-            Pointer::Touchpad { x, y } => {
-                if !d.touching {
-                    d.finger = None;
-                    return;
-                }
-                let (last_x, last_y) = d.finger.unwrap_or((ax.unwrap_or(0), ay.unwrap_or(0)));
-                let (nx, ny) = (ax.unwrap_or(last_x), ay.unwrap_or(last_y));
-                let moved = d.finger.map(|_| (nx - last_x, ny - last_y));
-                d.finger = Some((nx, ny));
-                if let Some((dx, dy)) = moved {
-                    // As shares of the pad: what gestures are measured in.
-                    let across = dx as f64 / (x.1 - x.0) as f64;
-                    let down = dy as f64 / (y.1 - y.0) as f64;
-                    match d.touch.moved(across.abs() + down.abs()) {
-                        Moves::Pointer => {
-                            // The pad's width covers about the screen's width.
-                            let sx = bounds.0 / (x.1 - x.0) as f64;
-                            let sy = bounds.1 / (y.1 - y.0) as f64;
-                            let s = sx.min(sy) * crate::pointer::pad_speed();
-                            self.move_by(dx as f64 * s, dy as f64 * s);
-                        }
-                        // As a wheel turns: fingers drawn toward the user
-                        // are the wheel turned toward the user, which
-                        // Shine counts as negative.
-                        Moves::Scroll => {
-                            let (wx, wy) = crate::pointer::pad_wheel((
-                                across * touchpad::NOTCHES_A_PAD,
-                                -down * touchpad::NOTCHES_A_PAD,
-                            ));
-                            self.wheel_acc.0 += wx;
-                            self.wheel_acc.1 += wy;
-                        }
-                    }
-                }
-            }
+            Pointer::Touchpad { .. } => {}
         }
     }
 
@@ -466,8 +593,10 @@ impl Input {
             // the secondary one with two fingers on it.
             BTN_LEFT if touchpad => {
                 let d = &mut self.devices[device];
-                if down {
-                    d.pad_button = d.touch.pressed();
+                match &mut d.pad {
+                    Some(pad) if down => d.pad_button = pad.pressed(),
+                    Some(pad) => pad.released(),
+                    None => {}
                 }
                 self.buttons[d.pad_button] = down;
             }
@@ -485,10 +614,8 @@ impl Input {
                     BTN_TOOL_QUADTAP => 4,
                     _ => 5,
                 };
-                let d = &mut self.devices[device];
-                // Another finger's position from now: no jump to it.
-                if d.touch.fingers(count, down) {
-                    d.finger = None;
+                if let Some(pad) = &mut self.devices[device].pad {
+                    pad.counted(count, down);
                 }
             }
             BTN_TOUCH => {
@@ -498,27 +625,37 @@ impl Input {
                     .is_some_and(|at| now.duration_since(at) < touchpad::WHILE_TYPING);
                 let d = &mut self.devices[device];
                 d.touching = down;
-                if !down {
-                    d.finger = None;
-                }
-                match d.pointer {
-                    // A touchscreen's touch is its click.
-                    Pointer::Absolute { .. } => self.buttons[0] = down,
-                    // A touchpad's is not, unless it was a tap.
-                    Pointer::Touchpad { .. } if down => d.touch.began(now),
-                    Pointer::Touchpad { .. } => {
-                        let tapped = d.touch.ended(now, typing);
-                        if let Some(button) = tapped.filter(|_| crate::pointer::tap_to_click()) {
-                            self.buttons[button] = true;
-                            self.tap = Some((button, now + TAP_HELD));
+                match (&mut d.pad, d.pointer) {
+                    // A touchpad's touch is not a click, unless it was a
+                    // tap.
+                    (Some(pad), _) => {
+                        let tapped = pad.touched(down, now, typing);
+                        let taps = crate::pointer::tap_to_click();
+                        match tapped {
+                            Some(Tap::Click(button)) if taps => {
+                                self.buttons[button] = true;
+                                self.tap = Some((button, now + TAP_HELD));
+                            }
+                            Some(Tap::Hold) if taps && crate::pointer::tap_drags() => {
+                                self.drag = Some(false)
+                            }
+                            Some(Tap::Release) => self.drag_ends(),
+                            _ => {}
                         }
                     }
-                    Pointer::Relative => {}
+                    // A touchscreen's touch is its click.
+                    (None, Pointer::Absolute { .. }) => self.buttons[0] = down,
+                    _ => {}
                 }
             }
             _ => {
                 if value == 1 {
                     self.typed = Some(Instant::now());
+                    for device in &mut self.devices {
+                        if let Some(pad) = &mut device.pad {
+                            pad.still();
+                        }
+                    }
                 }
                 self.keyboard(code, value)
             }

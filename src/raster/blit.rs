@@ -204,6 +204,50 @@ pub fn blit_surface_sub(
         return;
     }
 
+    // The same 1:1 copy for an image that is premultiplied: how a window
+    // manager fades a picture of a whole panel, or of the screen, in and
+    // out, every frame of the motion. White at any alpha only: `s·t +
+    // d·(1 − sa·t)`, four channels at a time and no sampling.
+    if let Some((ox, oy)) = axis_aligned_offset(xform).filter(|_| {
+        is_integral(&sub) && paint.blend == BlendMode::Premultiplied && paint.corner_radius <= 0.0
+    }) {
+        let tint = Src8::new(paint.color);
+        if tint.r == 255 && tint.g == 255 && tint.b == 255 {
+            if tint.a == 0 {
+                return;
+            }
+            let rect = Rect::new(ox as f64, oy as f64, sub_w, sub_h);
+            let (x0, y0, x1, y1) = rect.intersect(&clip).pixel_bounds(dst.w, dst.h);
+            let (sx0, sy0) = (sub.x0 as i64, sub.y0 as i64);
+            for py in y0..y1 {
+                let src_base =
+                    (py as i64 - oy + sy0) as usize * src.w + (x0 as i64 - ox + sx0) as usize;
+                let dst_base = py * dst.w + x0;
+                let n = x1 - x0;
+                let from = &src.buf[src_base..src_base + n];
+                let into = &mut dst.buf[dst_base..dst_base + n];
+                for (d, &s) in into.iter_mut().zip(from) {
+                    // Nothing there: most of an image of one panel.
+                    if s == 0 {
+                        continue;
+                    }
+                    let s = if tint.a == 255 {
+                        s
+                    } else {
+                        scale_argb(s, tint.a)
+                    };
+                    let sa = s >> 24;
+                    *d = if sa == 255 {
+                        s
+                    } else {
+                        add_argb(s, scale_argb(*d, 255 - sa))
+                    };
+                }
+            }
+            return;
+        }
+    }
+
     // Scaled or flipped but square to the screen: worked out per row and
     // column rather than per pixel (see `blit_scaled`).
     if blit_scaled(dst, src, sub, xform, paint, clip) {
@@ -247,7 +291,11 @@ pub fn blit_surface_sub(
                 continue;
             }
             // Premultiplied, the paint's alpha fades the colours as well.
-            let k = if paint.blend == BlendMode::Premultiplied { paint.color[3] } else { 1.0 };
+            let k = if paint.blend == BlendMode::Premultiplied {
+                paint.color[3]
+            } else {
+                1.0
+            };
             let tint = [
                 sr * paint.color[0] * k,
                 sg * paint.color[1] * k,
@@ -257,6 +305,31 @@ pub fn blit_surface_sub(
             dst.blend(dst_row + px, tint, cover, paint.blend);
         }
     }
+}
+
+/// All four channels of `p` times `a`/255, rounded.
+#[inline]
+fn scale_argb(p: u32, a: u32) -> u32 {
+    const LANES: u32 = 0x00FF_00FF;
+    const HALF: u32 = 0x0080_0080;
+    let rb = (p & LANES) * a + HALF;
+    let rb = ((rb + ((rb >> 8) & LANES)) >> 8) & LANES;
+    let ag = ((p >> 8) & LANES) * a + HALF;
+    let ag = ((ag + ((ag >> 8) & LANES)) >> 8) & LANES;
+    (ag << 8) | rb
+}
+
+/// `a + b`, channel by channel, each stopping at 255.
+#[inline]
+fn add_argb(a: u32, b: u32) -> u32 {
+    const LANES: u32 = 0x00FF_00FF;
+    let lanes = |x: u32, y: u32| {
+        let sum = (x & LANES) + (y & LANES);
+        // A lane past 255 has its ninth bit set: such a lane is filled.
+        let over = (sum >> 8) & 0x0001_0001;
+        (sum | (over * 0xFF)) & LANES
+    };
+    (lanes(a >> 8, b >> 8) << 8) | lanes(a, b)
 }
 
 /// How much of the pixel centred at `(u, v)` lies inside a `w × h` rectangle

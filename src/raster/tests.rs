@@ -542,6 +542,46 @@ fn a_rounded_blit_is_the_same_on_either_path() {
     assert!(delta <= 1, "off by {delta} at pixel {at}");
 }
 
+/// A premultiplied image (opaque, translucent and empty pixels) faded
+/// onto a picture: by the direct path, or by the sampled one when `nudged`.
+fn premultiplied(alpha: f32, nudged: bool) -> Surface {
+    let (w, h) = (24, 16);
+    let mut src = Surface::new(w, h);
+    let mut v = 0x1234_5678u32;
+    for (i, p) in src.buf.iter_mut().enumerate() {
+        v ^= v << 13;
+        v ^= v >> 17;
+        v ^= v << 5;
+        let a = match i % 3 {
+            0 => 0,
+            1 => 255,
+            _ => (v >> 24) & 0xFF,
+        };
+        // Each colour weighed by the alpha, as a premultiplied pixel is.
+        let c = |shift: u32| ((v >> shift) & 0xFF) * a / 255;
+        *p = (a << 24) | (c(16) << 16) | (c(8) << 8) | c(0);
+    }
+    let mut dst = Surface::opaque(32, 24);
+    for (i, p) in dst.buf.iter_mut().enumerate() {
+        *p = 0xFF00_0000 | ((i as u32 * 2_654_435_761) & 0x00FF_FFFF);
+    }
+    let mut paint = paint([1.0, 1.0, 1.0, alpha], 32, 24);
+    paint.blend = BlendMode::Premultiplied;
+    let by = if nudged { 3.0 + 1e-5 } else { 3.0 };
+    blit_surface(&mut dst, &src, &Transform::translation(by, by), &paint);
+    dst
+}
+
+#[test]
+fn a_premultiplied_blit_is_the_same_on_either_path() {
+    for alpha in [1.0, 0.5, 0.2, 0.0] {
+        let direct = premultiplied(alpha, false);
+        let sampled = premultiplied(alpha, true);
+        let (delta, at) = max_channel_delta(&direct, &sampled);
+        assert!(delta <= 1, "alpha {alpha}: off by {delta} at pixel {at}");
+    }
+}
+
 #[test]
 fn corner_coverage_is_whole_away_from_the_corners() {
     assert_eq!(corner_coverage(10.0, 10.0, 20.0, 20.0, 6.0), 1.0);

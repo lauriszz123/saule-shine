@@ -19,6 +19,7 @@
 //! | `attach(id, pixels, w, h)` | shared memory of `w×h` 32-bit pixels, sent once per size |
 //! | `commit(id)` | a new frame is in the pixels; **waited for**: the server has taken it when this returns, so the app may draw the next — which also paces the app to the server |
 //! | `setTitle(id, title)`, `setCursor(id, name)`, `close(id)` | one-way |
+//! | `getClipboard() -> text`, `setClipboard(text)` | the clipboard the server keeps for all its apps, so that what is copied in one is pasted in another |
 //!
 //! **Server → app**, one-way calls on `events`:
 //!

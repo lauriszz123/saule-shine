@@ -47,6 +47,9 @@ pub struct Glyph {
 pub struct FontRes {
     /// Shared with every other size of the same file: see [`shared_face`].
     face: Arc<Font>,
+    /// The file `face` is the common part of, where it is one (see
+    /// [`common_part`]): read when a character outside that part is drawn.
+    whole: Option<String>,
     size: f32,
     ascent: f64,
     line_height: f64,
@@ -62,6 +65,13 @@ impl FontRes {
             // Too large for the shared parse to draw well: one of its own.
             let face = Arc::new(parse_face(&read_font(path)?, size)?);
             return Ok(Self::with_face(face, size));
+        }
+        if let Some(part) = common_part(path) {
+            if let Ok(face) = shared_face(&part) {
+                let mut font = Self::with_face(face, size);
+                font.whole = Some(path.to_string());
+                return Ok(font);
+            }
         }
         Ok(Self::with_face(shared_face(path)?, size))
     }
@@ -79,6 +89,7 @@ impl FontRes {
 
         FontRes {
             face,
+            whole: None,
             size,
             ascent,
             line_height,
@@ -111,7 +122,10 @@ impl FontRes {
         let source: &Font = if self.face.has_glyph(ch) {
             &self.face
         } else {
-            fallback = fallback_for(ch);
+            // The rest of the same face first, where this is its common
+            // part: the same letterforms, and the same widths.
+            let whole = self.whole.as_deref().and_then(|path| shared_face(path).ok());
+            fallback = whole.filter(|face| face.has_glyph(ch)).or_else(|| fallback_for(ch));
             fallback.as_deref().unwrap_or(&self.face)
         };
 
@@ -208,6 +222,61 @@ impl FontRes {
             .fold(0.0, f64::max)
     }
 
+    /// Where each line of `text` starts, as an editor breaks it: at every
+    /// newline, and (`soft`) where a line would pass `limit` pixels, after
+    /// the last space on it or, with none, in the middle of the word.
+    /// Positions count characters from 1; the first is always 1.
+    ///
+    /// For text that is edited, where a caret's position has to be turned
+    /// into a line and back: every character stays on a line (a break
+    /// swallows nothing), which the lines `wrap` gives do not promise. One
+    /// pass with a running width: a page of text is measured once, not
+    /// once for every character on it.
+    pub fn wrap_starts(&mut self, text: &str, limit: f64, soft: bool) -> Vec<i64> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut starts = vec![1];
+        let soft = soft && limit.is_finite();
+        let (mut line_start, mut last_break) = (0usize, None::<usize>);
+        let (mut pen, mut prev) = (0.0, None::<char>);
+        let mut i = 0;
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch == '\n' {
+                starts.push(i as i64 + 2);
+                (line_start, last_break, pen, prev) = (i + 1, None, 0.0, None);
+                i += 1;
+                continue;
+            }
+            if ch == ' ' {
+                last_break = Some(i);
+            }
+            if soft {
+                // The width of the line so far, as `measure_line` adds it.
+                if ch != '\r' {
+                    self.ensure(ch);
+                    if let Some(p) = prev {
+                        pen += self.kern(p, ch);
+                    }
+                    pen += self.cache[&ch].advance;
+                    prev = Some(ch);
+                }
+                if pen > limit && i > line_start {
+                    let at = match last_break {
+                        Some(space) if space > line_start => space + 1,
+                        _ => i,
+                    };
+                    starts.push(at as i64 + 1);
+                    (line_start, last_break, pen, prev) = (at, None, 0.0, None);
+                    // From the new line's first character, measured anew.
+                    i = at;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        starts
+    }
+
     /// Greedy line breaking at `limit` pixels, honouring explicit newlines.
     ///
     /// Breaks fall after spaces and between wide (CJK, kana, hangul, emoji)
@@ -291,6 +360,24 @@ fn parse_face(bytes: &[u8], size: f32) -> Result<Font, String> {
         ..FontSettings::default()
     };
     Font::from_bytes(bytes, settings).map_err(|e| format!("could not parse font: {e}"))
+}
+
+/// The common part of the face in `path`, where there is one: the file
+/// beside it named the same with `.common` before its ending
+/// (`Sans.common.ttf` for `Sans.ttf`).
+///
+/// A file holding only the characters most text is made of, cut from the
+/// whole one with its outlines, widths and kerning as they were. Parsing
+/// reads every outline in a file ([`shared_face`]), and a program reads
+/// its fonts as it starts: the common part is a tenth of the outlines and
+/// a tenth of the wait, and the whole file is read only when a character
+/// outside it is drawn, if one ever is. What is drawn is the same either
+/// way.
+fn common_part(path: &str) -> Option<String> {
+    let file = std::path::Path::new(path);
+    let ending = file.extension()?.to_str()?;
+    let part = file.with_extension(format!("common.{ending}"));
+    part.is_file().then(|| part.to_string_lossy().into_owned())
 }
 
 fn read_font(path: &str) -> Result<Vec<u8>, String> {
@@ -677,6 +764,64 @@ mod tests {
         assert!(large.height() > small.height() * 4.0);
     }
 
+    /// A face in two files, in a folder of its own: `part` as the common
+    /// part of `whole`. None on a host without the two fonts.
+    fn in_two_parts(name: &str, part: &str, whole: &str) -> Option<String> {
+        let dir = std::env::temp_dir().join(format!("shine-font-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::copy(part, dir.join("Face.common.ttf")).ok()?;
+        std::fs::copy(whole, dir.join("Face.ttf")).ok()?;
+        Some(dir.join("Face.ttf").to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn a_face_with_a_common_part_starts_from_it_and_reads_the_rest_when_asked() {
+        // Two faces that cannot be mistaken for each other: one whose
+        // letters are all one width as the common part of one whose
+        // letters are not.
+        let fixed = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
+        let sans = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+        let Some(path) = in_two_parts("parts", fixed, sans) else {
+            return;
+        };
+        let (Ok(mut font), Ok(mut alone), Ok(mut whole)) = (
+            FontRes::from_file(&path, 20.0),
+            FontRes::from_file(fixed, 20.0),
+            FontRes::from_file(sans, 20.0),
+        ) else {
+            return;
+        };
+        // What the common part has is drawn from it,
+        assert_eq!(font.measure("iiii"), alone.measure("iiii"));
+        assert_eq!(font.measure("iiii"), font.measure("mmmm"));
+        assert_eq!(font.height(), alone.height());
+        // and what it lacks from the whole file: a letter only the whole
+        // one has is as wide as that one draws it.
+        let Some(only) = ('\u{0531}'..'\u{0556}')
+            .find(|&ch| whole.face.has_glyph(ch) && !alone.face.has_glyph(ch))
+        else {
+            return;
+        };
+        let text = only.to_string();
+        assert_eq!(font.measure(&text), whole.measure(&text));
+        assert!(font.measure(&text) > 0.0);
+        // A size too large for a shared parse is the whole file's own.
+        let huge = FontRes::from_file(&path, 300.0).unwrap();
+        assert!(huge.whole.is_none());
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap());
+    }
+
+    #[test]
+    fn a_face_without_a_common_part_is_the_file_itself() {
+        assert_eq!(common_part("/nowhere/at/all/Sans.ttf"), None);
+        assert_eq!(common_part("/nowhere/at/all/Sans"), None);
+        let Some(font) = font(12.0) else {
+            return;
+        };
+        // (A host may have one beside its font: then it says which.)
+        assert!(font.whole.is_none() || font.whole.as_deref().and_then(common_part).is_some());
+    }
+
     #[test]
     fn text_too_large_for_the_shared_parse_gets_its_own() {
         let (Some(small), Some(huge)) = (font(12.0), font(300.0)) else {
@@ -756,6 +901,55 @@ mod tests {
         let Some(f) = font(20.0) else { return };
         assert!(f.height() > 0.0);
         assert!(f.height() >= f.ascent());
+    }
+
+    /// The line starts as they were first worked out: the width of the
+    /// line so far measured afresh for every character.
+    fn starts_plainly(font: &mut FontRes, text: &str, limit: f64, soft: bool) -> Vec<i64> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut starts = vec![1i64];
+        let (mut line_start, mut last_break, mut i) = (1usize, 0usize, 1usize);
+        while i <= chars.len() {
+            let ch = chars[i - 1];
+            if ch == '\n' {
+                starts.push(i as i64 + 1);
+                line_start = i + 1;
+                last_break = 0;
+            } else {
+                if ch == ' ' {
+                    last_break = i;
+                }
+                if soft && limit.is_finite() {
+                    let so_far: String = chars[line_start - 1..i].iter().collect();
+                    if font.measure(&so_far) > limit && i > line_start {
+                        let at = if last_break > line_start { last_break + 1 } else { i };
+                        starts.push(at as i64);
+                        line_start = at;
+                        last_break = 0;
+                        i = at - 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        starts
+    }
+
+    #[test]
+    fn wrap_starts_are_what_measuring_every_prefix_gives() {
+        let Some(mut font) = font(16.0) else { return };
+        let text = "The quick brown fox  jumps over\nthe lazy dog.\n\nAVeryLongWordWithNoSpacesInItAtAllThatGoesOnAndOn and  then some, wider: WAVE Yo.\r\nend";
+        for limit in [40.0, 75.0, 120.0, 400.0, f64::INFINITY] {
+            for soft in [true, false] {
+                assert_eq!(
+                    font.wrap_starts(text, limit, soft),
+                    starts_plainly(&mut font, text, limit, soft),
+                    "limit {limit}, soft {soft}"
+                );
+            }
+        }
+        assert_eq!(font.wrap_starts("", 50.0, true), [1]);
+        assert_eq!(font.wrap_starts("a\nb", 50.0, false), [1, 3]);
     }
 
     #[test]

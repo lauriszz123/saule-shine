@@ -64,7 +64,18 @@ Two halves, deliberately:
   keeps drawing on the CPU while still presenting through the GPU
   (`SHINE_GPU_DRAW=1` draws through OpenGL even where it is only Mesa on
   the CPU, which on the bare screen Shine otherwise passes over for its
-  own, faster drawing), and
+  own, faster drawing). A window inside a Shine display server draws on
+  the CPU when the server does, and on Intel's oldest chips (GMA 900 to
+  3150), where OpenGL on no surface is not to be trusted.
+  `Graphics.getRenderer()` is the chip the bare screen is drawn by, as it
+  names itself, or "" when the CPU draws, and then
+  `Graphics.getRendererProblem()` is why: which step of starting OpenGL
+  failed, or which of Shine's shaders the chip's driver turned down and
+  what it said of each (every shader is tried, so one failure lists them
+  all). Each of Shine's shaders is compiled in the one variant a draw
+  needs (a blend mode, a kind of sampling: `gpu/program.rs`), which is
+  what lets them run on chips with no branches and 64 instructions to a
+  shader, Intel's GMA 3150 among them. And
   `SHINE_TRACE_FRAMES=1` reports, with the frame times, how many surfaces
   were copied between the CPU and the GPU.
 
@@ -134,6 +145,13 @@ loads, reporting failure as `nil` instead of raising
 - `newFont(size [, path])` takes the size first. With no path you get the
   host's UI typeface, so text works with no assets to ship; font handle `0` is
   that default face.
+- A font file is read whole before its first letter is drawn, once a
+  program however many sizes are asked of it. Where `Name.common.ttf` lies
+  beside `Name.ttf` (the same face cut down to the characters most text is
+  made of, with a tool such as fontTools' `pyftsubset`), Shine starts from
+  that file and reads the whole one only when a character outside it is
+  drawn: a program with a six-thousand-character face starts as fast as
+  one with a few hundred. What is drawn is the same.
 - Point lists (`polygon`, `polyline`, `points`) take a flat table of
   coordinates — `{x1, y1, x2, y2, ...}` — instead of varargs.
 - Scissor rectangles are transformed by the current transform, so clipping
@@ -281,6 +299,48 @@ is all a game loop reading held keys needs.
 
 **Density** — `getScale()`
 
+### Shaders
+
+Shine draws images, shapes and text. An effect on top of those (a blur, a
+ripple, a wash of colour) is the program's to write, as a shader:
+
+```saule
+local invert = Graphics.newShader(String.join("\n", {
+    "vec4 effect(vec4 colour, sampler2D image, vec2 uv, vec2 pixel) {",
+    "    vec4 was = Texel(image, uv);",
+    "    return vec4(1.0 - was.rgb, was.a) * colour;",
+    "}",
+}))
+if invert != nil then
+    Graphics.setShader(invert!)
+    Graphics.draw(picture, 20.0, 20.0)
+    Graphics.setShader()
+end
+```
+
+`effect` is called for every pixel an image is drawn to while the shader
+is set: `colour` is the paint colour, `image` the image, `uv` where in it
+the pixel reads (0 to 1) and `pixel` the same in the image's own pixels.
+`Texel(image, uv)` reads the image, `texel` is one of its pixels in `uv`,
+and `uniform`s the source declares are set with `shader.send(name, x, y,
+z, w)`. A source may also have a `void vertex(vec2 uv, vec2 pixel)`,
+between `#ifdef VERTEX` and `#endif` with `effect` between `#ifdef PIXEL`
+and `#endif`: it runs once a corner and leaves what it works out in the
+source's own `varying`s. An effect that reads a pixel's neighbours works
+out where they are there, which is what keeps it within what the oldest
+chips run (`gpu/shader.rs` has their limits).
+
+`Graphics.capture(canvas, x, y, w, h)` copies what is on the target under
+a rectangle into a canvas, made to fit it: what an effect over what is
+already drawn starts from. A frosted panel is the two together (uikit's
+`Blur`): what is behind it captured small, softened by a shader on its way
+down through smaller images and back up, and drawn back.
+
+`newShader` gives `nil` where there is no shader to be had, and
+`Graphics.getShaderProblem()` says why: the processor is drawing, or the
+graphics chip's own complaint about the source. A program draws without
+the effect then.
+
 ### Scale
 
 `Window.getScale()` is how many pixels a point of the UI is: a UI lays
@@ -374,6 +434,30 @@ silent no-op.
 mouse's. They take effect on the bare screen, where Shine reads the
 trackpad itself; in a window the desktop around has already made of the
 fingers what it makes.
+
+On the bare screen Shine makes a touchpad's fingers into movement itself
+(`state/console/touchpad.rs`): each finger is followed by itself, so one
+landing or lifting moves nothing; a reading that wanders under a still
+finger, or leaps as a finger lifts, is not movement; a faster finger goes
+further; a tap clicks, and a touch straight after a tap holds the button
+until it lifts, which drags. Two fingers scroll, wherever they are on the
+pad and however they lie to each other, and the pointer keeps out of it:
+a touch that has had two fingers on it scrolls until the last one lifts,
+and beside a finger that may be a thumb or the lower of two scrolling
+nothing moves until it is known which. A scroll let go of while moving
+carries on, slowing, until it has run down, the pad is touched or a key
+is pressed. A pad that is its own button takes a finger
+that came down along its bottom edge and stays there for a thumb waiting
+to press, not a second finger, and its bottom right for the secondary
+button.
+
+A mouse moved fast takes the pointer further than the same distance
+moved slowly, up to twice as far (`pointer::quickened`), under
+`Mouse.setPointerSpeed`; a wheel that turns smoothly scrolls by the parts
+of a notch it says. `Mouse.setAcceleration(on)`,
+`Mouse.setTapAndDrag(on)` and `Mouse.setTouchpadInertia(on)` turn the
+quickening, the drag after a tap and the scroll that carries on off and
+on; each is on unless turned off.
 
 **`Devices.list()`** — what the machine is typed on and pointed at with,
 each as `"kind<TAB>where<TAB>name"`: kind is `keyboard`, `mouse`,

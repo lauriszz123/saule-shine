@@ -10,12 +10,12 @@
 //! [`crate::state::Engine`] owns a `Renderer` alongside the OS window and
 //! forwards the drawing calls to it.
 
-mod blur;
 mod canvas;
 mod draw;
 mod mirror;
 mod pixels;
 mod scratch;
+mod shader;
 mod text;
 
 #[cfg(test)]
@@ -57,6 +57,11 @@ pub struct Renderer {
     /// is the only slot that is never allocated or released.
     pub(crate) fonts: Vec<Slot<FontRes>>,
     pub(crate) free_fonts: Vec<usize>,
+    /// The program's own shaders (`Graphics.newShader`), and the one
+    /// images are drawn through, if any.
+    pub(crate) shaders: Vec<Slot<shader::ShaderRes>>,
+    pub(crate) free_shaders: Vec<usize>,
+    pub(crate) shader: Option<usize>,
     pub(crate) background: [f64; 4],
     pub(crate) st: GState,
     pub(crate) stack: Vec<Saved>,
@@ -81,6 +86,9 @@ impl Renderer {
             // Slot 0 is the default face: reserved, lazily filled, never freed.
             fonts: vec![Slot::reserved()],
             free_fonts: Vec::new(),
+            shaders: Vec::new(),
+            free_shaders: Vec::new(),
+            shader: None,
             background: [0.0, 0.0, 0.0, 1.0],
             st: GState::default(),
             stack: Vec::new(),

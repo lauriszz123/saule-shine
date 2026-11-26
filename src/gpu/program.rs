@@ -45,6 +45,28 @@ unsafe fn link_with(
     attributes: &[&str],
 ) -> Result<glow::Program, String> {
     // SAFETY: the caller's context is current.
+    unsafe { link_variant(gl, es, "", vertex, fragment, attributes) }
+}
+
+/// A program whose fragment shader is one variant of `fragment`: the
+/// `#define` lines in `defines` choose, as it is compiled, what the
+/// shader would otherwise have to choose for every pixel.
+///
+/// That is the difference between a shader that runs everywhere and one
+/// that does not. Intel's chips up to the GMA 3150 have no branches, 64
+/// instructions and four rounds of texture reads to a shader: one that
+/// carries every blend mode and every kind of sampling, picked by
+/// uniforms, is several times that, and the same shader cut down to the
+/// one mode and the one kind a draw needs fits with room to spare.
+pub(super) unsafe fn link_variant(
+    gl: &glow::Context,
+    es: bool,
+    defines: &str,
+    vertex: &str,
+    fragment: &str,
+    attributes: &[&str],
+) -> Result<glow::Program, String> {
+    // SAFETY: the caller's context is current.
     unsafe {
         let program = gl.create_program().map_err(|e| format!("GL program: {e}"))?;
         let mut shaders = Vec::new();
@@ -53,7 +75,8 @@ unsafe fn link_with(
             (glow::FRAGMENT_SHADER, true, fragment),
         ] {
             let shader = gl.create_shader(kind).map_err(|e| format!("GL shader: {e}"))?;
-            gl.shader_source(shader, &format!("{}{source}", header(es, fragment_stage)));
+            let chosen = if fragment_stage { defines } else { "" };
+            gl.shader_source(shader, &format!("{}{chosen}{source}", header(es, fragment_stage)));
             gl.compile_shader(shader);
             if !gl.get_shader_compile_status(shader) {
                 return Err(format!(
@@ -82,7 +105,63 @@ unsafe fn link_with(
     }
 }
 
-unsafe fn uniform(gl: &glow::Context, program: glow::Program, name: &str) -> Option<glow::UniformLocation> {
+/// The number a shader variant is compiled with for a blend mode: what it
+/// has to hand the blend stage (see `gpu::blend_state`). Alpha, add and
+/// subtract are given the same thing, the colour and how much of it.
+pub(crate) fn shader_mode(blend: crate::raster::BlendMode) -> u8 {
+    use crate::raster::BlendMode;
+    match blend {
+        BlendMode::Alpha | BlendMode::Add | BlendMode::Subtract => 0,
+        BlendMode::Multiply => 3,
+        BlendMode::Screen => 4,
+        BlendMode::Replace => 5,
+        BlendMode::Premultiplied => 6,
+    }
+}
+
+/// The variants of one shader made so far, each when a draw first needs
+/// it: a program for a key, or nothing for one the GPU turned down, which
+/// is then drawn on the CPU and not tried again.
+pub(crate) struct Variants<K, P> {
+    made: std::cell::RefCell<std::collections::HashMap<K, Option<std::rc::Rc<P>>>>,
+}
+
+impl<K: Copy + Eq + std::hash::Hash + std::fmt::Debug, P> Variants<K, P> {
+    pub(crate) fn new() -> Self {
+        Variants { made: Default::default() }
+    }
+
+    /// The program for `key`, made with `make` if this is the first time.
+    pub(crate) fn get(
+        &self,
+        key: K,
+        make: impl FnOnce() -> Result<P, String>,
+    ) -> Option<std::rc::Rc<P>> {
+        if let Some(known) = self.made.borrow().get(&key) {
+            return known.clone();
+        }
+        let made = match make() {
+            Ok(program) => Some(std::rc::Rc::new(program)),
+            Err(why) => {
+                eprintln!("shine: the GPU cannot run shader {key:?} ({}); drawn on the CPU", why.trim());
+                None
+            }
+        };
+        self.made.borrow_mut().insert(key, made.clone());
+        made
+    }
+
+    /// Every program made.
+    pub(crate) fn programs(&self) -> Vec<std::rc::Rc<P>> {
+        self.made.borrow().values().flatten().cloned().collect()
+    }
+}
+
+pub(super) unsafe fn uniform(
+    gl: &glow::Context,
+    program: glow::Program,
+    name: &str,
+) -> Option<glow::UniformLocation> {
     // SAFETY: the caller's context is current.
     unsafe { gl.get_uniform_location(program, name) }
 }
@@ -137,14 +216,25 @@ pub(crate) struct BlitProgram {
     pub(crate) sub: Option<glow::UniformLocation>,
     pub(crate) tint: Option<glow::UniformLocation>,
     pub(crate) radius: Option<glow::UniformLocation>,
-    pub(crate) filtered: Option<glow::UniformLocation>,
-    pub(crate) check_inside: Option<glow::UniformLocation>,
-    pub(crate) opaque: Option<glow::UniformLocation>,
-    pub(crate) mode: Option<glow::UniformLocation>,
+}
+
+/// Which blit shader a draw needs (see [`link_variant`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BlitKey {
+    /// What the blend stage is given (see [`shader_mode`]).
+    pub(crate) mode: u8,
+    /// The shader decides which pixels are inside the region: a turned
+    /// image, whose pixels no scissor holds.
+    pub(crate) check_inside: bool,
+    pub(crate) rounded: bool,
+    /// The nearest pixel of the image, not a mix of the four round it.
+    pub(crate) nearest: bool,
+    /// The image's alpha bytes mean nothing: read as opaque.
+    pub(crate) opaque: bool,
 }
 
 impl BlitProgram {
-    pub(crate) unsafe fn new(gl: &glow::Context, es: bool) -> Result<BlitProgram, String> {
+    pub(crate) unsafe fn new(gl: &glow::Context, es: bool, key: BlitKey) -> Result<BlitProgram, String> {
         // The square becomes the region (`size`), grown by `pad` all round,
         // the transform's rows place it on the target, and the target's
         // pixels map onto clip space without a flip: row 0 of a target
@@ -173,91 +263,75 @@ impl BlitProgram {
             uniform vec4 sub;
             uniform vec4 tint;
             uniform float radius;
-            uniform float filtered;
-            uniform float checkInside;
-            uniform float opaque;
-            uniform float mode;
             varying vec2 local;
-
-            float inside(float value, float extent) {
-                if (extent <= 1.0) {
-                    return extent * 0.5;
-                }
-                return clamp(value, 0.5, extent - 0.5);
-            }
-
-            float corner(vec2 p, vec2 extent, float r) {
-                float cx;
-                if (p.x < r) {
-                    cx = r;
-                } else if (p.x > extent.x - r) {
-                    cx = extent.x - r;
-                } else {
-                    return 1.0;
-                }
-                float cy;
-                if (p.y < r) {
-                    cy = r;
-                } else if (p.y > extent.y - r) {
-                    cy = extent.y - r;
-                } else {
-                    return 1.0;
-                }
-                return clamp(r - distance(p, vec2(cx, cy)) + 0.5, 0.0, 1.0);
-            }
 
             void main() {
                 vec2 p = local;
-                if (checkInside > 0.5
-                    && (p.x < 0.0 || p.y < 0.0 || p.x >= sub.z || p.y >= sub.w)) {
-                    discard;
-                }
+                // Whether the pixel is drawn at all: nothing, where any of these is.
+                float keep = 1.0;
+            #ifdef CHECK_INSIDE
+                vec2 from = step(0.0, p);
+                vec2 before = 1.0 - step(sub.zw, p);
+                keep = from.x * from.y * before.x * before.y;
+            #endif
                 float cover = 1.0;
-                if (radius > 0.0) {
-                    cover = corner(p, sub.zw, radius);
-                    if (cover <= 0.0) {
-                        discard;
-                    }
-                }
-                vec2 at = sub.xy + vec2(inside(p.x, sub.z), inside(p.y, sub.w));
-                if (filtered < 0.5) {
-                    at = floor(at) + 0.5;
-                }
+            #ifdef ROUNDED
+                // The middle of the corner's curve, where the pixel is in a corner:
+                // off the straight part of both edges at once.
+                vec2 off = p - clamp(p, vec2(radius), sub.zw - radius);
+                float cornered = sign(abs(off.x)) * sign(abs(off.y));
+                cover = mix(1.0, clamp(radius - length(off) + 0.5, 0.0, 1.0), cornered);
+            #endif
+                // Half a pixel inside the region, or its middle where it is that thin.
+                vec2 middle = sub.zw * 0.5;
+                vec2 at = sub.xy + clamp(p, min(vec2(0.5), middle), max(sub.zw - 0.5, middle));
+            #ifdef NEAREST
+                at = floor(at) + 0.5;
+            #endif
                 vec4 sampled = texture2D(image, at / textureSize);
-                if (opaque > 0.5) {
-                    sampled.a = 1.0;
-                }
-                // A see-through pixel leaves the target as it is, in every
-                // mode, as on the CPU.
-                if (sampled.a <= 0.0) {
+            #ifdef OPAQUE
+                sampled.a = 1.0;
+            #endif
+                // A see-through pixel leaves the target as it is, in every mode, as
+                // on the CPU. One test for all of it: this chip's oldest relatives
+                // count each `discard` as they count a texture read.
+                if (keep * cover * sampled.a <= 0.0) {
                     discard;
                 }
                 vec4 colour = sampled * tint;
                 float sa = colour.a * cover;
-                // What the blend stage needs for each of the CPU's modes
-                // (see `gpu::blend_state`).
-                if (mode < 0.5 || (mode > 0.5 && mode < 2.5)) {
-                    // alpha, add, subtract: the colour, weighed by `sa`.
-                    gl_FragColor = vec4(colour.rgb, sa);
-                } else if (mode < 3.5) {
-                    // multiply: the factor the target is multiplied by.
-                    gl_FragColor = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
-                } else if (mode < 4.5) {
-                    // screen: the colour already weighed.
-                    gl_FragColor = vec4(colour.rgb * sa, sa);
-                } else if (mode < 5.5) {
-                    // replace: as it is (only drawn with no partial cover).
-                    gl_FragColor = colour;
-                } else {
-                    // premultiplied: the image's colours are weighed
-                    // already; the tint's alpha and the cover weigh them
-                    // further.
-                    gl_FragColor = vec4(sampled.rgb * tint.rgb * tint.a * cover, sa);
-                }
+            #if MODE == 0
+                // alpha, add, subtract: the colour, weighed by `sa`.
+                gl_FragColor = vec4(colour.rgb, sa);
+            #elif MODE == 3
+                // multiply: the factor the target is multiplied by.
+                gl_FragColor = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
+            #elif MODE == 4
+                // screen: the colour already weighed.
+                gl_FragColor = vec4(colour.rgb * sa, sa);
+            #elif MODE == 5
+                // replace: as it is (only drawn with no partial cover).
+                gl_FragColor = colour;
+            #else
+                // premultiplied: the image's colours are weighed already; the tint's
+                // alpha and the cover weigh them further.
+                gl_FragColor = vec4(sampled.rgb * tint.rgb * tint.a * cover, sa);
+            #endif
             }";
+        let mut defines = format!("#define MODE {}\n", key.mode);
+        for (on, name) in [
+            (key.check_inside, "CHECK_INSIDE"),
+            (key.rounded, "ROUNDED"),
+            (key.nearest, "NEAREST"),
+            (key.opaque, "OPAQUE"),
+        ] {
+            if on {
+                defines.push_str(&format!("#define {name}\n"));
+            }
+        }
         // SAFETY: the caller's context is current.
         unsafe {
-            let program = link(gl, es, vertex, fragment)?;
+            let program = link_variant(gl, es, &defines, vertex, fragment, &[])?;
             gl.use_program(Some(program));
             gl.uniform_1_i32(uniform(gl, program, "image").as_ref(), 0);
             Ok(BlitProgram {
@@ -270,10 +344,6 @@ impl BlitProgram {
                 sub: uniform(gl, program, "sub"),
                 tint: uniform(gl, program, "tint"),
                 radius: uniform(gl, program, "radius"),
-                filtered: uniform(gl, program, "filtered"),
-                check_inside: uniform(gl, program, "checkInside"),
-                opaque: uniform(gl, program, "opaque"),
-                mode: uniform(gl, program, "mode"),
                 program,
             })
         }
@@ -291,23 +361,32 @@ pub(crate) struct ShapeProgram {
     pub(crate) program: glow::Program,
     pub(crate) target: Option<glow::UniformLocation>,
     pub(crate) area: Option<glow::UniformLocation>,
-    pub(crate) from_mask: Option<glow::UniformLocation>,
     pub(crate) rect: Option<glow::UniformLocation>,
     pub(crate) mask_origin: Option<glow::UniformLocation>,
     pub(crate) mask_corner: Option<glow::UniformLocation>,
     pub(crate) mask_scale: Option<glow::UniformLocation>,
-    pub(crate) antialias: Option<glow::UniformLocation>,
     pub(crate) colour: Option<glow::UniformLocation>,
-    pub(crate) gradient: Option<glow::UniformLocation>,
-    pub(crate) geometry: Option<glow::UniformLocation>,
+    pub(crate) ramp: Option<glow::UniformLocation>,
     pub(crate) stop_colour: Option<glow::UniformLocation>,
     pub(crate) stop_at: Option<glow::UniformLocation>,
-    pub(crate) stop_count: Option<glow::UniformLocation>,
-    pub(crate) mode: Option<glow::UniformLocation>,
+    pub(crate) stop_scale: Option<glow::UniformLocation>,
+}
+
+/// Which shape shader a fill needs (see [`link_variant`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ShapeKey {
+    /// What the blend stage is given (see [`shader_mode`]).
+    pub(crate) mode: u8,
+    /// Coverage from a mask of the CPU's, not from a rectangle.
+    pub(crate) from_mask: bool,
+    /// No antialiasing: a pixel is in or out.
+    pub(crate) hard: bool,
+    /// 0 a flat colour, 1 a linear gradient, 2 a radial one.
+    pub(crate) gradient: u8,
 }
 
 impl ShapeProgram {
-    pub(crate) unsafe fn new(gl: &glow::Context, es: bool) -> Result<ShapeProgram, String> {
+    pub(crate) unsafe fn new(gl: &glow::Context, es: bool, key: ShapeKey) -> Result<ShapeProgram, String> {
         // The square becomes the box of pixels to fill (`area`).
         let vertex = "
             attribute vec2 corner;
@@ -318,25 +397,17 @@ impl ShapeProgram {
                 gl_Position = vec4(device / target * 2.0 - 1.0, 0.0, 1.0);
             }";
         let fragment = "
-            uniform float fromMask;
             uniform vec4 rect;
             uniform sampler2D mask;
             uniform vec2 maskOrigin;
             uniform vec2 maskCorner;
             uniform vec2 maskScale;
-            uniform float antialias;
             uniform vec4 colour;
-            uniform float gradient;
-            uniform vec4 geometry;
-            uniform vec4 stopColour[8];
-            uniform float stopAt[8];
-            uniform float stopCount;
-            uniform float mode;
 
             float coverage(vec2 pixel) {
-                if (fromMask > 0.5) {
-                    return texture2D(mask, (maskCorner + pixel - maskOrigin + 0.5) * maskScale).r;
-                }
+            #ifdef FROM_MASK
+                return texture2D(mask, (maskCorner + pixel - maskOrigin + 0.5) * maskScale).r;
+            #else
                 float inside = 0.0;
                 for (int s = 0; s < 4; s++) {
                     float sy = pixel.y + (float(s) + 0.5) / 4.0;
@@ -346,82 +417,84 @@ impl ShapeProgram {
                 }
                 float across = clamp(min(pixel.x + 1.0, rect.z) - max(pixel.x, rect.x), 0.0, 1.0);
                 return inside / 4.0 * across;
+            #endif
             }
 
-            // The CPU's `Gradient::sample`, at the pixel's centre.
+            #if GRADIENT != 0
+            // Where along the gradient a pixel is: `dot(at, ramp.xy) + ramp.z` for a
+            // linear one, `length(at - ramp.xy) * ramp.z + ramp.w` for a radial one,
+            // the division done once, by whoever sets it.
+            uniform vec4 ramp;
+            uniform vec4 stopColour[8];
+            uniform float stopAt[8];
+            // One over the distance from the stop before, 0 for a stop there is not.
+            uniform float stopScale[8];
+
+            // The CPU's `Gradient::sample`, at the pixel's centre: from the first
+            // stop's colour, toward each next one by how far past the stop before it
+            // the pixel is. No branches: a chip that has none runs this too.
             vec4 paint(vec2 at) {
-                if (gradient < 0.5) {
-                    return colour;
-                }
-                float t;
-                if (gradient < 1.5) {
-                    vec2 axis = geometry.zw - geometry.xy;
-                    float length2 = dot(axis, axis);
-                    t = length2 <= 1e-12 ? 0.0 : dot(at - geometry.xy, axis) / length2;
-                } else {
-                    t = abs(geometry.z) <= 1e-12 ? 1.0 : length(at - geometry.xy) / geometry.z;
-                }
+            #if GRADIENT == 1
+                float t = dot(at, ramp.xy) + ramp.z;
+            #else
+                float t = length(at - ramp.xy) * ramp.z + ramp.w;
+            #endif
                 t = clamp(t, 0.0, 1.0);
-                if (t <= stopAt[0]) {
-                    return stopColour[0];
-                }
-                vec4 last = stopColour[0];
-                float lastAt = stopAt[0];
+                vec4 shade = stopColour[0];
                 for (int i = 1; i < 8; i++) {
-                    if (float(i) >= stopCount) {
-                        break;
-                    }
-                    if (t <= stopAt[i]) {
-                        float span = stopAt[i] - lastAt;
-                        float local = span <= 1.1920929e-7 ? 0.0 : (t - lastAt) / span;
-                        return last + (stopColour[i] - last) * local;
-                    }
-                    last = stopColour[i];
-                    lastAt = stopAt[i];
+                    float along = clamp((t - stopAt[i - 1]) * stopScale[i], 0.0, 1.0);
+                    shade += (stopColour[i] - shade) * along;
                 }
-                return last;
+                return shade;
             }
+            #endif
 
             void main() {
                 vec2 pixel = floor(gl_FragCoord.xy);
                 float c = coverage(pixel);
-                if (antialias < 0.5) {
-                    c = c >= 0.5 ? 1.0 : 0.0;
-                }
+            #ifdef HARD
+                c = c >= 0.5 ? 1.0 : 0.0;
+            #endif
                 if (c <= 0.0) {
                     discard;
                 }
+            #if GRADIENT != 0
                 vec4 source = paint(pixel + 0.5);
+            #else
+                vec4 source = colour;
+            #endif
                 float sa = source.a * c;
-                if (mode < 0.5 || (mode > 0.5 && mode < 2.5)) {
-                    gl_FragColor = vec4(source.rgb, sa);
-                } else if (mode < 3.5) {
-                    gl_FragColor = vec4(source.rgb * sa + 1.0 - sa, source.a * sa + 1.0 - sa);
-                } else {
-                    gl_FragColor = vec4(source.rgb * sa, sa);
-                }
+            #if MODE == 0
+                gl_FragColor = vec4(source.rgb, sa);
+            #elif MODE == 3
+                gl_FragColor = vec4(source.rgb * sa + 1.0 - sa, source.a * sa + 1.0 - sa);
+            #else
+                gl_FragColor = vec4(source.rgb * sa, sa);
+            #endif
             }";
+        let mut defines = format!("#define MODE {}\n#define GRADIENT {}\n", key.mode, key.gradient);
+        for (on, name) in [(key.from_mask, "FROM_MASK"), (key.hard, "HARD")] {
+            if on {
+                defines.push_str(&format!("#define {name}\n"));
+            }
+        }
         // SAFETY: the caller's context is current.
         unsafe {
-            let program = link(gl, es, vertex, fragment)?;
+            let program = link_variant(gl, es, &defines, vertex, fragment, &[])?;
             gl.use_program(Some(program));
             gl.uniform_1_i32(uniform(gl, program, "mask").as_ref(), 1);
             Ok(ShapeProgram {
                 target: uniform(gl, program, "target"),
                 area: uniform(gl, program, "area"),
-                from_mask: uniform(gl, program, "fromMask"),
                 rect: uniform(gl, program, "rect"),
                 mask_origin: uniform(gl, program, "maskOrigin"),
                 mask_corner: uniform(gl, program, "maskCorner"),
                 mask_scale: uniform(gl, program, "maskScale"),
-                antialias: uniform(gl, program, "antialias"),
                 colour: uniform(gl, program, "colour"),
-                gradient: uniform(gl, program, "gradient"),
-                geometry: uniform(gl, program, "geometry"),
+                ramp: uniform(gl, program, "ramp"),
                 stop_colour: uniform(gl, program, "stopColour"),
                 stop_at: uniform(gl, program, "stopAt"),
-                stop_count: uniform(gl, program, "stopCount"),
-                mode: uniform(gl, program, "mode"),
+                stop_scale: uniform(gl, program, "stopScale"),
                 program,
             })
         }
@@ -439,13 +512,29 @@ pub(crate) struct GlyphProgram {
     pub(crate) target: Option<glow::UniformLocation>,
     pub(crate) atlas_scale: Option<glow::UniformLocation>,
     pub(crate) colour: Option<glow::UniformLocation>,
-    pub(crate) mode: Option<glow::UniformLocation>,
-    pub(crate) exact: Option<glow::UniformLocation>,
-    pub(crate) filtered: Option<glow::UniformLocation>,
+}
+
+/// How a glyph's coverage is read from the atlas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GlyphSampling {
+    /// At a whole-pixel place: a texel a pixel, exactly.
+    Exact,
+    /// Scaled or turned, mixed from the texels round each pixel.
+    Filtered,
+    /// Scaled or turned, the nearest texel.
+    Nearest,
+}
+
+/// Which glyph shader a run of text needs (see [`link_variant`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TextKey {
+    /// What the blend stage is given (see [`shader_mode`]).
+    pub(crate) mode: u8,
+    pub(crate) sampling: GlyphSampling,
 }
 
 impl GlyphProgram {
-    pub(crate) unsafe fn new(gl: &glow::Context, es: bool) -> Result<GlyphProgram, String> {
+    pub(crate) unsafe fn new(gl: &glow::Context, es: bool, key: TextKey) -> Result<GlyphProgram, String> {
         let vertex = "
             attribute vec2 position;
             attribute vec2 place;
@@ -462,56 +551,57 @@ impl GlyphProgram {
             uniform sampler2D atlas;
             uniform float atlasScale;
             uniform vec4 colour;
-            uniform float mode;
-            uniform float exact;
-            uniform float filtered;
             varying vec2 local;
             varying vec4 glyph;
 
             void main() {
-                float a;
-                if (exact > 0.5) {
-                    a = texture2D(atlas, (glyph.xy + floor(local) + 0.5) * atlasScale).r;
-                } else if (filtered > 0.5) {
-                    // Past half a texel outside, every tap the CPU takes is
-                    // outside the glyph; nearer, the atlas's empty border
-                    // gives the zeroes it reads.
-                    if (local.x < -0.5 || local.y < -0.5
-                        || local.x > glyph.z + 0.5 || local.y > glyph.w + 0.5) {
-                        discard;
-                    }
-                    a = texture2D(atlas, (glyph.xy + local) * atlasScale).r;
-                } else {
-                    vec2 p = floor(local);
-                    if (p.x < 0.0 || p.y < 0.0 || p.x >= glyph.z || p.y >= glyph.w) {
-                        discard;
-                    }
-                    a = texture2D(atlas, (glyph.xy + p + 0.5) * atlasScale).r;
-                }
-                if (a <= 0.0) {
+            #ifdef EXACT
+                float keep = 1.0;
+                float a = texture2D(atlas, (glyph.xy + floor(local) + 0.5) * atlasScale).r;
+            #else
+            #ifdef FILTERED
+                // Past half a texel outside, every tap the CPU takes is outside the
+                // glyph; nearer, the atlas's empty border gives the zeroes it reads.
+                vec2 from = step(-0.5, local);
+                vec2 upTo = step(local, glyph.zw + 0.5);
+                float keep = from.x * from.y * upTo.x * upTo.y;
+                float a = texture2D(atlas, (glyph.xy + local) * atlasScale).r;
+            #else
+                vec2 p = floor(local);
+                vec2 from = step(0.0, p);
+                vec2 before = 1.0 - step(glyph.zw, p);
+                float keep = from.x * from.y * before.x * before.y;
+                float a = texture2D(atlas, (glyph.xy + p + 0.5) * atlasScale).r;
+            #endif
+            #endif
+                if (keep * a <= 0.0) {
                     discard;
                 }
                 float sa = colour.a * a;
-                if (mode < 0.5 || (mode > 0.5 && mode < 2.5)) {
-                    gl_FragColor = vec4(colour.rgb, sa);
-                } else if (mode < 3.5) {
-                    gl_FragColor = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
-                } else {
-                    gl_FragColor = vec4(colour.rgb * sa, sa);
-                }
+            #if MODE == 0
+                gl_FragColor = vec4(colour.rgb, sa);
+            #elif MODE == 3
+                gl_FragColor = vec4(colour.rgb * sa + 1.0 - sa, colour.a * sa + 1.0 - sa);
+            #else
+                gl_FragColor = vec4(colour.rgb * sa, sa);
+            #endif
             }";
+        let sampling = match key.sampling {
+            GlyphSampling::Exact => "#define EXACT\n",
+            GlyphSampling::Filtered => "#define FILTERED\n",
+            GlyphSampling::Nearest => "",
+        };
+        let defines = format!("#define MODE {}\n{sampling}", key.mode);
         // SAFETY: the caller's context is current.
         unsafe {
-            let program = link_with(gl, es, vertex, fragment, &["position", "place", "cell"])?;
+            let program =
+                link_variant(gl, es, &defines, vertex, fragment, &["position", "place", "cell"])?;
             gl.use_program(Some(program));
             gl.uniform_1_i32(uniform(gl, program, "atlas").as_ref(), 1);
             Ok(GlyphProgram {
                 target: uniform(gl, program, "target"),
                 atlas_scale: uniform(gl, program, "atlasScale"),
                 colour: uniform(gl, program, "colour"),
-                mode: uniform(gl, program, "mode"),
-                exact: uniform(gl, program, "exact"),
-                filtered: uniform(gl, program, "filtered"),
                 program,
             })
         }
@@ -604,117 +694,6 @@ impl FillBatchProgram {
                 target: uniform(gl, program, "target"),
                 mask_scale: uniform(gl, program, "maskScale"),
                 mode: uniform(gl, program, "mode"),
-                program,
-            })
-        }
-    }
-}
-
-/// A Gaussian blur, one pass of it (see `gpu::blur`, and `raster::blur`,
-/// whose numbers it repeats): across, from a copy of the target into a
-/// texture between the passes; then down from that one, mixed into the
-/// target by a rounded rectangle's coverage. Every tap is read at a texel's
-/// centre, so filtering adds nothing; the reach is at most
-/// `raster::blur::MOST` either way, the loop's fixed bound.
-pub(crate) struct BlurProgram {
-    pub(crate) program: glow::Program,
-    pub(crate) down: Option<glow::UniformLocation>,
-    pub(crate) reach: Option<glow::UniformLocation>,
-    pub(crate) sigma: Option<glow::UniformLocation>,
-    pub(crate) surface: Option<glow::UniformLocation>,
-    pub(crate) here: Option<glow::UniformLocation>,
-    pub(crate) source_origin: Option<glow::UniformLocation>,
-    pub(crate) source_size: Option<glow::UniformLocation>,
-    pub(crate) original_origin: Option<glow::UniformLocation>,
-    pub(crate) original_size: Option<glow::UniformLocation>,
-    pub(crate) shape: Option<glow::UniformLocation>,
-    pub(crate) corner: Option<glow::UniformLocation>,
-    pub(crate) opacity: Option<glow::UniformLocation>,
-    pub(crate) fade: Option<glow::UniformLocation>,
-}
-
-impl BlurProgram {
-    pub(crate) unsafe fn new(gl: &glow::Context, es: bool) -> Result<BlurProgram, String> {
-        let vertex = "
-            attribute vec2 corner;
-            void main() {
-                gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
-            }";
-        let fragment = "
-            uniform sampler2D source;
-            uniform sampler2D original;
-            uniform float down;
-            uniform float reach;
-            uniform float sigma;
-            // The target surface's size; where the pixel drawn into is on
-            // it (what the render target's corner is); where the source's
-            // and the original's corners are on it, and their sizes.
-            uniform vec2 surface;
-            uniform vec2 here;
-            uniform vec2 sourceOrigin;
-            uniform vec2 sourceSize;
-            uniform vec2 originalOrigin;
-            uniform vec2 originalSize;
-            uniform vec4 shape;
-            uniform float corner;
-            uniform float opacity;
-            uniform float fade;
-
-            float coverage(vec2 p) {
-                float r = min(corner, min((shape.z - shape.x), (shape.w - shape.y)) / 2.0);
-                vec2 q = abs(p - (shape.xy + shape.zw) / 2.0) - ((shape.zw - shape.xy) / 2.0 - r);
-                float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-                float fading = fade > 0.0 ? clamp((shape.w - p.y) / fade, 0.0, 1.0) : 1.0;
-                return clamp(0.5 - d, 0.0, 1.0) * opacity * fading;
-            }
-
-            void main() {
-                vec2 pixel = floor(gl_FragCoord.xy) + here;
-                vec4 sum = vec4(0.0);
-                float total = 0.0;
-                for (int i = -64; i <= 64; i++) {
-                    float fi = float(i);
-                    if (abs(fi) > reach) {
-                        continue;
-                    }
-                    float weight = exp(-(fi * fi) / (2.0 * sigma * sigma));
-                    vec2 at = pixel;
-                    if (down > 0.5) {
-                        at.y = clamp(pixel.y + fi, 0.0, surface.y - 1.0);
-                    } else {
-                        at.x = clamp(pixel.x + fi, 0.0, surface.x - 1.0);
-                    }
-                    sum += weight * texture2D(source, (at - sourceOrigin + 0.5) / sourceSize);
-                    total += weight;
-                }
-                vec4 blurred = sum / total;
-                if (down < 0.5) {
-                    gl_FragColor = blurred;
-                    return;
-                }
-                vec4 was = texture2D(original, (pixel - originalOrigin + 0.5) / originalSize);
-                gl_FragColor = was + (blurred - was) * coverage(pixel + 0.5);
-            }";
-        // SAFETY: the caller's context is current.
-        unsafe {
-            let program = link(gl, es, vertex, fragment)?;
-            gl.use_program(Some(program));
-            gl.uniform_1_i32(uniform(gl, program, "source").as_ref(), 0);
-            gl.uniform_1_i32(uniform(gl, program, "original").as_ref(), 1);
-            Ok(BlurProgram {
-                down: uniform(gl, program, "down"),
-                reach: uniform(gl, program, "reach"),
-                sigma: uniform(gl, program, "sigma"),
-                surface: uniform(gl, program, "surface"),
-                here: uniform(gl, program, "here"),
-                source_origin: uniform(gl, program, "sourceOrigin"),
-                source_size: uniform(gl, program, "sourceSize"),
-                original_origin: uniform(gl, program, "originalOrigin"),
-                original_size: uniform(gl, program, "originalSize"),
-                shape: uniform(gl, program, "shape"),
-                corner: uniform(gl, program, "corner"),
-                opacity: uniform(gl, program, "opacity"),
-                fade: uniform(gl, program, "fade"),
                 program,
             })
         }

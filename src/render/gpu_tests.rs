@@ -415,31 +415,6 @@ const SCENES: &[(&str, Scene)] = &[
         r.set_canvas(None)?;
         r.draw_canvas(large, 5.0, 5.0, 0.0, 1.0, 1.0, 0.0, 0.0)
     }),
-    ("a blur over stripes and an image", |r| {
-        stripes(r)?;
-        r.blur(20.0, 15.0, 110.0, 80.0, 12.0, 0.0, 1.0, 0.0)
-    }),
-    ("a rounded blur, faded in, under a tint", |r| {
-        stripes(r)?;
-        r.blur(15.5, 10.25, 120.0, 90.0, 20.0, 14.0, 0.7, 0.0)?;
-        r.set_color(0.1, 0.1, 0.15, 0.4);
-        r.rectangle("fill", 15.5, 10.25, 120.0, 90.0, 14.0, 14.0)
-    }),
-    ("a blur at the screen's edges, as wide as it goes", |r| {
-        stripes(r)?;
-        r.blur(-10.0, -10.0, 200.0, 60.0, 64.0, 0.0, 1.0, 0.0)?;
-        r.blur(100.0, 70.0, 100.0, 100.0, 3.0, 8.0, 1.0, 0.0)
-    }),
-    ("a blur cut by the scissor, moved and scaled", |r| {
-        stripes(r)?;
-        r.set_scissor(Some((30.0, 20.0, 70.0, 60.0)));
-        r.push(false);
-        r.translate(10.0, 5.0);
-        r.scale(1.5, 1.5);
-        r.blur(5.0, 5.0, 60.0, 50.0, 6.0, 5.0, 1.0, 0.0)?;
-        r.pop()?;
-        Ok(())
-    }),
     ("a translucent layer faded in, premultiplied", |r| {
         stripes(r)?;
         let layer = r.new_canvas(100, 70)?;
@@ -455,20 +430,6 @@ const SCENES: &[(&str, Scene)] = &[
         r.draw_canvas(layer, 30.0, 25.0, 0.0, 1.0, 1.0, 0.0, 0.0)?;
         r.draw_canvas(layer, 100.0, 60.0, 0.3, 0.8, 0.8, 0.0, 0.0)?;
         r.set_blend_mode("alpha")
-    }),
-    ("a bar's blur fading out toward its bottom", |r| {
-        stripes(r)?;
-        r.blur(0.0, 0.0, 160.0, 40.0, 16.0, 0.0, 1.0, 28.0)
-    }),
-    ("a blur on an image with see-through pixels", |r| {
-        backdrop(r);
-        let canvas = r.new_canvas(80, 60)?;
-        r.set_canvas(Some(canvas))?;
-        r.set_color(1.0, 0.8, 0.2, 0.6);
-        r.rectangle("fill", 10.0, 10.0, 30.0, 40.0, 0.0, 0.0)?;
-        r.blur(0.0, 0.0, 80.0, 60.0, 8.0, 10.0, 1.0, 0.0)?;
-        r.set_canvas(None)?;
-        r.draw_canvas(canvas, 30.0, 20.0, 0.0, 1.0, 1.0, 0.0, 0.0)
     }),
 ];
 
@@ -537,4 +498,113 @@ fn the_gpu_draws_what_the_cpu_draws() {
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A renderer drawing on the GPU, when there is one to test with.
+fn on_a_gpu() -> Option<Renderer> {
+    let device = Device::headless().ok()?;
+    let mut r = Renderer::headless(160, 120);
+    r.attach_gpu_always(Rc::new(device));
+    Some(r)
+}
+
+fn channels(pixel: u32) -> [i32; 4] {
+    [24, 16, 8, 0].map(|shift| ((pixel >> shift) & 0xFF) as i32)
+}
+
+#[test]
+fn an_image_drawn_through_a_shader_is_what_the_shader_makes_of_it() {
+    let Some(mut r) = on_a_gpu() else {
+        eprintln!("skipped: no GPU");
+        return;
+    };
+    // Its colours turned inside out, and as much of it as it is told.
+    let shader = r
+        .new_shader(
+            "uniform float much;
+             vec4 effect(vec4 colour, sampler2D image, vec2 uv, vec2 pixel) {
+                 vec4 was = Texel(image, uv);
+                 return vec4(mix(was.rgb, 1.0 - was.rgb, much), was.a) * colour;
+             }",
+        )
+        .expect("a shader");
+    let image = r.new_canvas(40, 30).unwrap();
+    r.set_canvas(Some(image)).unwrap();
+    r.clear(Some((1.0, 0.5, 0.0, 1.0)));
+    r.set_canvas(None).unwrap();
+    r.clear(Some((0.0, 0.0, 0.0, 1.0)));
+
+    r.shader_send(shader, "much", &[1.0]).unwrap();
+    r.set_shader(Some(shader)).unwrap();
+    r.draw_canvas(image, 10.0, 10.0, 0.0, 1.0, 1.0, 0.0, 0.0).unwrap();
+    // Without it again, beside the first.
+    r.set_shader(None).unwrap();
+    r.draw_canvas(image, 60.0, 10.0, 0.0, 1.0, 1.0, 0.0, 0.0).unwrap();
+    r.sync_cpu(Which::Screen);
+
+    let through = channels(r.screen.buf[20 * 160 + 20]);
+    let plain = channels(r.screen.buf[20 * 160 + 70]);
+    assert_eq!(plain, [255, 255, 128, 0], "the image as it is");
+    for (got, want) in through.iter().zip([255, 0, 127, 255]) {
+        assert!((got - want).abs() <= 2, "{through:?}");
+    }
+    // With a part for the corners: where the neighbour is read is worked
+    // out there, and the two halves of the image swap.
+    let swap = r
+        .new_shader(
+            "varying vec2 across;
+             #ifdef VERTEX
+             void vertex(vec2 uv, vec2 pixel) { across = vec2(1.0 - uv.x, uv.y); }
+             #endif
+             #ifdef PIXEL
+             vec4 effect(vec4 colour, sampler2D image, vec2 uv, vec2 pixel) {
+                 return Texel(image, across);
+             }
+             #endif",
+        )
+        .expect("a shader with a vertex part");
+    let halves = r.new_canvas(40, 30).unwrap();
+    r.set_canvas(Some(halves)).unwrap();
+    r.clear(Some((1.0, 0.0, 0.0, 1.0)));
+    r.set_color(0.0, 0.0, 1.0, 1.0);
+    r.rectangle("fill", 20.0, 0.0, 20.0, 30.0, 0.0, 0.0).unwrap();
+    r.set_color(1.0, 1.0, 1.0, 1.0);
+    r.set_canvas(None).unwrap();
+    r.set_shader(Some(swap)).unwrap();
+    r.draw_canvas(halves, 100.0, 60.0, 0.0, 1.0, 1.0, 0.0, 0.0).unwrap();
+    r.set_shader(None).unwrap();
+    r.sync_cpu(Which::Screen);
+    assert_eq!(channels(r.screen.buf[70 * 160 + 105]), [255, 0, 0, 255], "blue from the right");
+    assert_eq!(channels(r.screen.buf[70 * 160 + 135]), [255, 255, 0, 0], "red from the left");
+
+    // A source with a mistake in it is an error with the GPU's words.
+    assert!(r.new_shader("vec4 effect(vec4 c, sampler2D i, vec2 u, vec2 p) { return nothing; }").is_err());
+}
+
+#[test]
+fn a_capture_is_what_was_on_the_target_made_to_fit() {
+    for gpu in [true, false] {
+        let mut r = if gpu {
+            let Some(r) = on_a_gpu() else {
+                eprintln!("skipped: no GPU");
+                continue;
+            };
+            r
+        } else {
+            Renderer::headless(160, 120)
+        };
+        r.clear(Some((0.0, 0.0, 0.0, 1.0)));
+        // The left half white, from 40 to 80; the right black.
+        r.set_color(1.0, 1.0, 1.0, 1.0);
+        r.rectangle("fill", 40.0, 20.0, 40.0, 60.0, 0.0, 0.0).unwrap();
+        let small = r.new_canvas(20, 15).unwrap();
+        r.capture(small, 40.0, 20.0, 80.0, 60.0).unwrap();
+        r.sync_cpu(Which::Canvas(r.canvas_index(small, "test").unwrap()));
+        let idx = r.canvas_index(small, "test").unwrap();
+        let pixels = &r.canvases[idx].value.as_ref().unwrap().buf;
+        let left = channels(pixels[7 * 20 + 3]);
+        let right = channels(pixels[7 * 20 + 16]);
+        assert!(left[1] > 250 && left[0] == 255, "gpu {gpu}: {left:?}");
+        assert!(right[1] < 5 && right[0] == 255, "gpu {gpu}: {right:?}");
+    }
 }

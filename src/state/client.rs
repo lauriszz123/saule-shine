@@ -570,6 +570,47 @@ impl Backend for Client {
         let name = if visible { "arrow" } else { "none" };
         self.tell("setCursor", vec![Wire::Str(name.into())]);
     }
+
+    fn clipboard(&mut self) -> Option<String> {
+        let Client {
+            looper,
+            conn,
+            input,
+            ..
+        } = self;
+        match looper.call(&mut Events { input: &mut *input }, *conn, ROOT, "getClipboard", Vec::new()) {
+            Ok(answer) => match answer.as_slice() {
+                [Wire::Str(text)] => Some(text.clone()),
+                _ => Some(String::new()),
+            },
+            Err(CallError::Disconnected) => {
+                self.input.open = false;
+                Some(String::new())
+            }
+            // A server from before it kept one: this process's own, then.
+            Err(_) => None,
+        }
+    }
+
+    fn set_clipboard(&mut self, text: &str) -> bool {
+        // Waited for, so that what is copied is there to paste when this
+        // returns, and a server without a clipboard is found out.
+        let Client {
+            looper,
+            conn,
+            input,
+            ..
+        } = self;
+        let args = vec![Wire::Str(text.to_string())];
+        match looper.call(&mut Events { input: &mut *input }, *conn, ROOT, "setClipboard", args) {
+            Ok(_) => true,
+            Err(CallError::Disconnected) => {
+                self.input.open = false;
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 /// The name `Mouse.setCursor` takes for a cursor style.
@@ -602,6 +643,12 @@ impl Drop for Client {
 #[cfg(target_os = "linux")]
 fn headless_gpu() -> Option<std::rc::Rc<crate::gpu::Device>> {
     if !crate::gpu::drawing_wanted() {
+        return None;
+    }
+    if !crate::gpu::headless_trusted() {
+        if crate::gpu::tracing() {
+            eprintln!("shine: an old Intel graphics chip; drawing on the CPU");
+        }
         return None;
     }
     match crate::gpu::Device::headless() {

@@ -87,26 +87,29 @@ impl Console {
                             .device()
                             .is_some_and(|dev| crate::gpu::software_renderer(&dev.description)) =>
                 {
-                    if crate::gpu::tracing() {
-                        eprintln!(
-                            "shine: no GPU, only Mesa on the CPU; drawing on the CPU with Shine's own code"
-                        );
-                    }
+                    let description = gpu.device().map(|dev| dev.description.clone());
+                    crate::gpu::set_problem(&format!(
+                        "no driver took the graphics chip, only Mesa's software OpenGL ({})",
+                        description.unwrap_or_default()
+                    ));
+                    crate::gpu::children_draw_on_cpu();
                 }
                 Ok(gpu) => {
-                    if crate::gpu::tracing() {
-                        if let Some(dev) = gpu.device() {
+                    if let Some(dev) = gpu.device() {
+                        crate::gpu::set_renderer(&dev.description);
+                        if crate::gpu::tracing() {
                             eprintln!("shine: drawing on the GPU: {}", dev.description);
                         }
                     }
                     console.gpu = Some(gpu);
                 }
                 Err(e) => {
-                    if crate::gpu::tracing() {
-                        eprintln!("shine: no GPU to draw on ({e}); drawing on the CPU");
-                    }
+                    crate::gpu::set_problem(&e);
+                    crate::gpu::children_draw_on_cpu();
                 }
             }
+        } else {
+            crate::gpu::set_problem("the screen's controller has no cursor of its own");
         }
         Ok(console)
     }

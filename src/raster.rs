@@ -10,7 +10,6 @@
 
 mod blit;
 mod blit_scaled;
-mod blur;
 mod fill;
 mod pixel;
 #[cfg(test)]
@@ -18,6 +17,5 @@ mod tests;
 
 pub(crate) use blit::*;
 pub(crate) use blit_scaled::*;
-pub(crate) use blur::{blur, BlurArea};
 pub(crate) use fill::*;
 pub(crate) use pixel::*;
