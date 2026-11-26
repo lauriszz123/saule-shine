@@ -156,6 +156,9 @@ struct Device {
     found: Option<Found>,
     /// The absolute position this frame's events are building up.
     abs: (Option<i32>, Option<i32>),
+    /// Tablets and screens: where the device last said it was, on its own
+    /// axes, from the moment it was opened (see [`whole_position`]).
+    at: (i32, i32),
     touching: bool,
     /// Touchpads: the fingers on it, and what they come to.
     pad: Option<Pad>,
@@ -166,6 +169,26 @@ struct Device {
     rel: (i32, i32),
     moved_at: Option<f64>,
     fine_wheel: bool,
+}
+
+/// Where a tablet or a screen is, from what it `said` this time and where
+/// it last was (`at`, which is brought up to date).
+///
+/// The kernel passes on an axis only when its value changes, so a report
+/// of one axis is a whole position, the other axis being where it was: for
+/// the device, not for the pointer, which a mouse may have moved since, or
+/// which a display server started later has put in the middle of the
+/// screen. Taking the other axis from the pointer sent a press straight
+/// down from where the last one was to another column: the first click
+/// after logging out, in a virtual machine, whose pointer is a tablet.
+fn whole_position(at: &mut (i32, i32), said: (Option<i32>, Option<i32>)) -> (i32, i32) {
+    if let Some(x) = said.0 {
+        at.0 = x;
+    }
+    if let Some(y) = said.1 {
+        at.1 = y;
+    }
+    *at
 }
 
 impl Device {
@@ -230,6 +253,20 @@ impl Device {
         } else {
             Pointer::Relative
         };
+        // Where a tablet or a screen is now, which it won't say again
+        // until it moves.
+        let at = match pointer {
+            Pointer::Absolute { .. } => {
+                let now = |axis| {
+                    let mut info = AbsInfo::default();
+                    // Safety: writes one `input_absinfo`, which `AbsInfo` mirrors.
+                    unsafe { libc::ioctl(fd, eviocgabs(axis), &mut info) };
+                    info.value
+                };
+                (now(ABS_X), now(ABS_Y))
+            }
+            _ => (0, 0),
+        };
 
         let kind = match pointer {
             Pointer::Touchpad { .. } => Some(Kind::Touchpad),
@@ -263,6 +300,7 @@ impl Device {
             pointer,
             found,
             abs: (None, None),
+            at,
             touching: false,
             pad,
             pad_button: 0,
@@ -562,12 +600,8 @@ impl Input {
                 let scale = |v: i32, (lo, hi): (i32, i32), size: f64| {
                     (v - lo) as f64 / (hi - lo) as f64 * (size - 1.0)
                 };
-                if let Some(v) = ax {
-                    self.pos.0 = scale(v, x, bounds.0);
-                }
-                if let Some(v) = ay {
-                    self.pos.1 = scale(v, y, bounds.1);
-                }
+                let (ax, ay) = whole_position(&mut d.at, (ax, ay));
+                self.pos = (scale(ax, x, bounds.0), scale(ay, y, bounds.1));
                 self.clamp();
             }
             Pointer::Touchpad { .. } => {}
@@ -746,3 +780,21 @@ impl Input {
         }
     }
 }
+
+#[cfg(test)]
+mod position_tests {
+    use super::whole_position;
+
+    #[test]
+    fn a_report_of_one_axis_is_a_position_with_the_other_where_the_device_was() {
+        // Opened where it already was: 580 across, 368 down.
+        let mut at = (580, 368);
+        // Moved straight down: only that axis is said.
+        assert_eq!(whole_position(&mut at, (None, Some(566))), (580, 566));
+        // Then across, and then both.
+        assert_eq!(whole_position(&mut at, (Some(27), None)), (27, 566));
+        assert_eq!(whole_position(&mut at, (Some(500), Some(300))), (500, 300));
+        assert_eq!(at, (500, 300));
+    }
+}
+
