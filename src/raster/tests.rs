@@ -563,7 +563,7 @@ fn premultiplied(alpha: f32, nudged: bool) -> Surface {
     }
     let mut dst = Surface::opaque(32, 24);
     for (i, p) in dst.buf.iter_mut().enumerate() {
-        *p = 0xFF00_0000 | ((i as u32 * 2_654_435_761) & 0x00FF_FFFF);
+        *p = 0xFF00_0000 | ((i as u32).wrapping_mul(2_654_435_761) & 0x00FF_FFFF);
     }
     let mut paint = paint([1.0, 1.0, 1.0, alpha], 32, 24);
     paint.blend = BlendMode::Premultiplied;
