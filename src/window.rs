@@ -231,6 +231,29 @@ fn window_set_target_fps(fps: i64) -> Result<(), String> {
     state::with(|e| e.set_target_fps(fps))?
 }
 
+/// `Window.waitEvents(seconds)` — end a frame that drew nothing by waiting
+/// for input, `seconds` at the longest, in place of `Graphics.present()`.
+///
+/// A program that is doing nothing still went round its loop sixty times
+/// a second to find that out. Where the window can tell when something
+/// has arrived (a window on a Saule display server), this returns as soon
+/// as it has, or when the time is up, and the loop goes round once for
+/// it. Anywhere else it is `Graphics.present()`, which paces the frame as
+/// it always did. Something drawn since the last present is presented
+/// either way.
+#[saule_export(class = "Window", name = "waitEvents")]
+fn window_wait_events(seconds: f64) -> Result<(), String> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err("Window.waitEvents: the time must be a non-negative number".into());
+    }
+    let timeout = std::time::Duration::from_secs_f64(seconds.min(1.0));
+    state::with(|e| {
+        state::flush_releases(&mut e.r);
+        e.rest(timeout)
+    })??;
+    Ok(())
+}
+
 /// `Window.getTargetFPS()` — the current cap, or `0` when uncapped.
 #[saule_export(class = "Window", name = "getTargetFPS")]
 fn window_get_target_fps() -> Result<i64, String> {

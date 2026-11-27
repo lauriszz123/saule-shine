@@ -63,6 +63,18 @@ pub(crate) trait Backend {
         Ok(false)
     }
 
+    /// Wait until input arrives, `timeout` at the longest, and take it in
+    /// as [`Backend::pump`] does. `false`, at once, from a backend with
+    /// nothing to wait on: the caller then paces the frame as it always
+    /// did.
+    ///
+    /// For a program with nothing to draw and nothing to do until somebody
+    /// touches it: sixty turns of its loop a second to find that out was
+    /// a fifth of a netbook's processor for every window left open.
+    fn rest(&mut self, _timeout: std::time::Duration) -> bool {
+        false
+    }
+
     /// The backend has a reason to show a frame even though nothing new was
     /// drawn — a cursor it draws itself has moved, say.
     fn wants_present(&self) -> bool {

@@ -320,7 +320,7 @@ pub(super) struct Input {
     /// The screen size: the pointer stays inside it.
     bounds: (f64, f64),
     pub(super) pos: (f64, f64),
-    pub(super) buttons: [bool; 3],
+    pub(super) buttons: crate::state::input::Buttons,
     /// Wheel movement in notches since the last pump started.
     pub(super) wheel: (f64, f64),
     /// Taken in during the current pump, becoming [`Input::wheel`] at its end.
@@ -351,7 +351,7 @@ impl Input {
             bounds,
             // The pointer starts in the middle of the screen.
             pos: (bounds.0 / 2.0, bounds.1 / 2.0),
-            buttons: [false; 3],
+            buttons: Default::default(),
             wheel: (0.0, 0.0),
             wheel_acc: (0.0, 0.0),
             held: Vec::new(),
@@ -404,15 +404,17 @@ impl Input {
         if self.last_scan.elapsed() >= RESCAN_EVERY {
             self.scan();
         }
+        // The loop has looked at the buttons since the last pump.
+        self.buttons.next();
         // A tap lets go of its button, having held it at least a frame.
         if let Some((button, until)) = self.tap
             && Instant::now() >= until
         {
-            self.buttons[button] = false;
+            self.buttons.set(button, false);
             self.tap = None;
         } else if self.drag == Some(false) && self.tap.is_none() {
             // The frame after: two taps are two clicks, not a long one.
-            self.buttons[0] = true;
+            self.buttons.set(0, true);
             self.drag = Some(true);
         }
 
@@ -576,11 +578,11 @@ impl Input {
     /// The touch that held the button a tap clicked is over.
     fn drag_ends(&mut self) {
         match self.drag.take() {
-            Some(true) => self.buttons[0] = false,
+            Some(true) => self.buttons.set(0, false),
             // Over before its button went down: a click all the same,
             // unless the tap's own is still going.
             Some(false) if self.tap.is_none() => {
-                self.buttons[0] = true;
+                self.buttons.set(0, true);
                 self.tap = Some((0, Instant::now() + TAP_HELD));
             }
             _ => {}
@@ -632,11 +634,11 @@ impl Input {
                     Some(pad) => pad.released(),
                     None => {}
                 }
-                self.buttons[d.pad_button] = down;
+                self.buttons.set(d.pad_button, down);
             }
-            BTN_LEFT => self.buttons[0] = down,
-            BTN_RIGHT => self.buttons[1] = down,
-            BTN_MIDDLE => self.buttons[2] = down,
+            BTN_LEFT => self.buttons.set(0, down),
+            BTN_RIGHT => self.buttons.set(1, down),
+            BTN_MIDDLE => self.buttons.set(2, down),
             BTN_TOOL_FINGER | BTN_TOOL_DOUBLETAP | BTN_TOOL_TRIPLETAP | BTN_TOOL_QUADTAP
             | BTN_TOOL_QUINTTAP
                 if touchpad =>
@@ -667,7 +669,7 @@ impl Input {
                         let taps = crate::pointer::tap_to_click();
                         match tapped {
                             Some(Tap::Click(button)) if taps => {
-                                self.buttons[button] = true;
+                                self.buttons.set(button, true);
                                 self.tap = Some((button, now + TAP_HELD));
                             }
                             Some(Tap::Hold) if taps && crate::pointer::tap_drags() => {
@@ -678,7 +680,7 @@ impl Input {
                         }
                     }
                     // A touchscreen's touch is its click.
-                    (None, Pointer::Absolute { .. }) => self.buttons[0] = down,
+                    (None, Pointer::Absolute { .. }) => self.buttons.set(0, down),
                     _ => {}
                 }
             }

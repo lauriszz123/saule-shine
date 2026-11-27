@@ -170,6 +170,29 @@ impl Engine {
         self.backend.is_active()
     }
 
+    /// In place of [`Engine::present`] on a frame that drew nothing and
+    /// has nothing to do: wait until input arrives, `timeout` at the
+    /// longest, where the backend can tell when it has. Where it cannot,
+    /// or there is a frame to show after all, this is `present`.
+    pub fn rest(&mut self, timeout: Duration) -> Result<(), String> {
+        let stale = self.last_blit.elapsed() >= FORCE_BLIT_EVERY;
+        if self.r.screen_dirty || stale || self.backend.wants_present() {
+            return self.present();
+        }
+        let started = Instant::now();
+        if !self.backend.rest(timeout) {
+            return self.present();
+        }
+        self.follow_gpu();
+        crate::timer::mark_frame();
+        self.mouse
+            .observe(self.backend.mouse_buttons(), self.backend.wheel());
+        crate::trace::frame(Duration::ZERO, started.elapsed());
+        // The next frame is paced from now, not from before the wait.
+        self.next_frame = Instant::now() + self.frame_dur.unwrap_or_default();
+        Ok(())
+    }
+
     /// Present the framebuffer to the window, then sleep until the next frame
     /// deadline. This is the loop's single pacing point.
     pub fn present(&mut self) -> Result<(), String> {

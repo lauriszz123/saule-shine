@@ -239,7 +239,7 @@ between.
 **Lifecycle** — `create([width, height, title, resizable])` (1024×600 without a size; opens in the middle of the monitor the mouse is on; the whole screen on Saule Linux), `isOpen()`,
 `pollEvents()`, `close()`, `setQuitOnEscape(enable)`, `getQuitOnEscape()`
 
-**Pacing** — `setTargetFPS(fps)`, `getTargetFPS()`
+**Pacing** — `setTargetFPS(fps)`, `getTargetFPS()`, `waitEvents(seconds)`
 
 ### The event queue
 
@@ -379,6 +379,22 @@ UI on battery can drop to 30, and a 120 Hz display can ask for 120.
 `Timer.getFPS()` reports what was actually presented, averaged over the last 30
 frames — measured at `present`, not from `getDelta`, so a program that never
 calls `getDelta` still gets a true number.
+
+A program with nothing to draw has no frame to present and nothing to learn
+by going round its loop again a sixtieth of a second later. `waitEvents(seconds)`
+ends such a frame in place of `Graphics.present()`: it returns when input
+arrives, or after `seconds` (a second at the longest), whichever is first. Input
+arriving ends the wait at once, so it is not how late a click is seen. Only a
+window on a Saule display server can tell when something has arrived, by
+waiting on its connection; everywhere else `waitEvents` is `present()`, and
+paces the frame as that does. Anything drawn since the last present is
+presented either way.
+
+The mouse's buttons are shown to the loop as levels, looked at once after each
+pump of the event queue. On a Saule display server and on the bare screen a
+button changes at most once between two looks: a press and its release that
+arrive together, because the frame between them was a long one, are a press at
+this look and a release at the next, and not a click that never happened.
 
 Windows are resizable by default. The framebuffer is reallocated to match
 whenever the window changes size, so `getSize` reports live dimensions and

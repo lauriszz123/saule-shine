@@ -89,3 +89,121 @@ impl MouseState {
         self.wheel
     }
 }
+
+/// The mouse's buttons as a backend shows them to the frame loop.
+///
+/// The loop does not hear presses: it looks at whether each button is
+/// down, once after every pump, and takes a change from the last look
+/// for a press or a release. A click is over in a twentieth of a second,
+/// and a frame can take longer: both halves then arrive in one pump, the
+/// button is up at the next look as it was at the last, and the click
+/// never happened. On a slow machine that was any click made while a
+/// window was busy.
+///
+/// So a button changes at most once between two looks. Further changes
+/// wait their turn, one a look: a press and release that arrive together
+/// are down at this look and up at the next.
+#[derive(Debug, Default)]
+pub(crate) struct Buttons {
+    shown: [bool; 3],
+    /// Whether each has changed since the last look.
+    changed: [bool; 3],
+    /// The levels still to be shown, oldest first.
+    waiting: [std::collections::VecDeque<bool>; 3],
+}
+
+impl Buttons {
+    /// The button is now `down`.
+    pub(crate) fn set(&mut self, button: usize, down: bool) {
+        let Some(waiting) = self.waiting.get_mut(button) else {
+            return;
+        };
+        let latest = waiting.back().copied().unwrap_or(self.shown[button]);
+        if latest == down {
+            return;
+        }
+        if self.changed[button] || !waiting.is_empty() {
+            waiting.push_back(down);
+        } else {
+            self.shown[button] = down;
+            self.changed[button] = true;
+        }
+    }
+
+    /// A look has been taken: what was waiting may show, one change a
+    /// button. Called as a pump begins, before it reads anything new.
+    pub(crate) fn next(&mut self) {
+        for button in 0..3 {
+            self.changed[button] = false;
+            if let Some(down) = self.waiting[button].pop_front() {
+                self.shown[button] = down;
+                self.changed[button] = true;
+            }
+        }
+    }
+
+    /// What the loop sees at this look.
+    pub(crate) fn shown(&self) -> [bool; 3] {
+        self.shown
+    }
+}
+
+#[cfg(test)]
+mod button_tests {
+    use super::Buttons;
+
+    #[test]
+    fn a_click_inside_one_pump_is_a_press_and_then_a_release() {
+        let mut buttons = Buttons::default();
+        buttons.next();
+        buttons.set(0, true);
+        buttons.set(0, false);
+        assert_eq!(buttons.shown(), [true, false, false]);
+        buttons.next();
+        assert_eq!(buttons.shown(), [false, false, false]);
+        buttons.next();
+        assert_eq!(buttons.shown(), [false, false, false]);
+    }
+
+    #[test]
+    fn two_clicks_inside_one_pump_are_two_clicks() {
+        let mut buttons = Buttons::default();
+        buttons.next();
+        for down in [true, false, true, false] {
+            buttons.set(0, down);
+        }
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            seen.push(buttons.shown()[0]);
+            buttons.next();
+        }
+        assert_eq!(seen, [true, false, true, false, false]);
+    }
+
+    #[test]
+    fn a_button_held_stays_down_and_others_are_their_own() {
+        let mut buttons = Buttons::default();
+        buttons.next();
+        buttons.set(1, true);
+        buttons.set(1, true);
+        buttons.next();
+        buttons.set(0, true);
+        assert_eq!(buttons.shown(), [true, true, false]);
+        buttons.next();
+        buttons.set(1, false);
+        assert_eq!(buttons.shown(), [true, false, false]);
+    }
+
+    #[test]
+    fn a_release_and_press_inside_one_pump_are_both_seen() {
+        let mut buttons = Buttons::default();
+        buttons.next();
+        buttons.set(0, true);
+        buttons.next();
+        buttons.set(0, false);
+        buttons.set(0, true);
+        assert_eq!(buttons.shown(), [false, false, false]);
+        buttons.next();
+        assert_eq!(buttons.shown(), [true, false, false]);
+    }
+}

@@ -229,7 +229,7 @@ impl Backend for Console {
     }
 
     fn mouse_buttons(&self) -> [bool; 3] {
-        self.input.buttons
+        self.input.buttons.shown()
     }
 
     fn wheel(&self) -> (f64, f64) {

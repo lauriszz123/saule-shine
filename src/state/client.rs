@@ -38,7 +38,7 @@ struct Input {
     close_asked: bool,
     focused: bool,
     pointer: Option<(f64, f64)>,
-    buttons: [bool; 3],
+    buttons: super::input::Buttons,
     /// Wheel movement taken in during the current pump.
     wheel: (f64, f64),
     held: Vec<Key>,
@@ -123,7 +123,7 @@ impl Handler for Events<'_> {
                 if let Some(b) = int(b)
                     && (1..=3).contains(&b)
                 {
-                    input.buttons[b as usize - 1] = boolean(down);
+                    input.buttons.set(b as usize - 1, boolean(down));
                 }
             }
             ("wheel", [dx, dy]) => {
@@ -467,6 +467,8 @@ impl Backend for Client {
 
     fn pump(&mut self) {
         self.input.wheel = (0.0, 0.0);
+        // The loop has looked at the buttons since the last pump.
+        self.input.buttons.next();
         let Client { looper, input, .. } = self;
         // Everything that has arrived, without waiting; a few rounds at
         // most, in case answering one call let another in.
@@ -480,6 +482,34 @@ impl Backend for Client {
             self.input.open = false;
         }
         self.wheel = self.input.wheel;
+    }
+
+    /// Everything the server sends comes down the one connection, input
+    /// and the window's own changes alike, so waiting on it is waiting
+    /// for anything at all to happen to the window.
+    fn rest(&mut self, timeout: Duration) -> bool {
+        self.input.wheel = (0.0, 0.0);
+        self.input.buttons.next();
+        let Client { looper, input, .. } = self;
+        // The wait is counted in whole milliseconds, rounded down: one
+        // of less than a millisecond would not wait at all, and a caller
+        // waiting for a moment to come would go round and round until it
+        // had. Rounded up, it comes back once, just after.
+        let whole = Duration::from_millis((timeout.as_micros() as u64).div_ceil(1000).max(1));
+        let mut wait = Some(whole);
+        for _ in 0..8 {
+            match looper.dispatch(&mut Events { input: &mut *input }, wait) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            // Something came: whatever else is there already, and back.
+            wait = Some(Duration::ZERO);
+        }
+        if !looper.is_open(self.conn) {
+            self.input.open = false;
+        }
+        self.wheel = self.input.wheel;
+        true
     }
 
     fn present(&mut self, buf: &[u32], w: usize, h: usize) -> Result<(), String> {
@@ -537,7 +567,7 @@ impl Backend for Client {
     }
 
     fn mouse_buttons(&self) -> [bool; 3] {
-        self.input.buttons
+        self.input.buttons.shown()
     }
 
     fn wheel(&self) -> (f64, f64) {
