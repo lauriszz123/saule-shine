@@ -41,6 +41,10 @@ pub(crate) struct Device {
     pub(crate) shapes: RefCell<Atlas>,
     /// Vertices made per draw (a line of glyphs) go up through this.
     pub(crate) stream: glow::Buffer,
+    /// Which corners make the two triangles of each square of a batch
+    /// (`batch::MOST` of them), so that a square is four corners sent
+    /// and not six.
+    pub(crate) squares: glow::Buffer,
     /// Sharing textures with other processes, where EGL can (see
     /// `gpu::dmabuf`).
     #[cfg(target_os = "linux")]
@@ -407,6 +411,12 @@ impl Device {
             let atlas = RefCell::new(Atlas::new(&gl)?);
             let shapes = RefCell::new(Atlas::new(&gl)?);
             let stream = gl.create_buffer().map_err(|e| format!("GL buffer: {e}"))?;
+            let squares = gl.create_buffer().map_err(|e| format!("GL buffer: {e}"))?;
+            let corners: Vec<u16> = (0..super::batch::MOST as u16)
+                .flat_map(|square| [0, 1, 2, 2, 1, 3].map(|corner| square * 4 + corner))
+                .collect();
+            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(squares));
+            gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, bytes_of(&corners), glow::STATIC_DRAW);
             let quad = gl.create_buffer().map_err(|e| format!("GL buffer: {e}"))?;
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(quad));
             let corners: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
@@ -430,6 +440,7 @@ impl Device {
                 atlas,
                 shapes,
                 stream,
+                squares,
                 #[cfg(target_os = "linux")]
                 egl,
                 mask: Cell::new(None),
@@ -518,6 +529,7 @@ impl Drop for Device {
             }
             self.gl.delete_program(self.fill_batch.program);
             self.gl.delete_buffer(self.stream);
+            self.gl.delete_buffer(self.squares);
             self.atlas.borrow().delete(&self.gl);
             self.shapes.borrow().delete(&self.gl);
             if let Some((mask, _, _)) = self.mask.take() {

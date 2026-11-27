@@ -63,6 +63,14 @@ impl Saved {
     }
 }
 
+/// The longest side, in pixels, of a rounded rectangle the GPU draws as
+/// one shape from the atlas and not in pieces.
+const SMALL: f64 = 128.0;
+
+/// The most shapes known by what was asked for, before they are forgotten
+/// and learnt again.
+const MOST_KNOWN: usize = 4096;
+
 impl Renderer {
     pub fn set_color(&mut self, r: f64, g: f64, b: f64, a: f64) {
         self.st.color = [r, g, b, a];
@@ -439,6 +447,20 @@ impl Renderer {
         rx: f64,
         ry: f64,
     ) -> Result<(), String> {
+        // A small one the GPU draws is one shape from the atlas, found by
+        // its size and where on a pixel it starts: a key cap, an icon's
+        // tile, a pill. In pieces it was eight shapes for an outline.
+        let small = self.on_gpu() && {
+            let t = self.st.transform;
+            (w * t.a).abs() <= SMALL && (h * t.d).abs() <= SMALL
+        };
+        if small && (rx > 0.0 || ry > 0.0) {
+            let dims = [w, h, rx, ry];
+            return self.draw_known(mode, 1, &dims, (x, y), |r| {
+                let segs = r.segments_for(rx.abs().max(ry.abs()));
+                geom::rounded_rect_path_into(x, y, w, h, rx, ry, segs, &mut r.scratch.local);
+            });
+        }
         if mode == "line" && self.outline_in_pieces(x, y, w, h, rx, ry)? {
             return Ok(());
         }
@@ -446,6 +468,76 @@ impl Renderer {
             return Ok(());
         }
         self.rectangle_path(mode, x, y, w, h, rx, ry)
+    }
+
+    /// Draw the closed shape `build` makes the outline of, which is wholly
+    /// said by `kind` (which sort of shape) and `dims` (its measures) at
+    /// `at`: from the shape atlas, by those alone, when it has been drawn
+    /// before at the same part of a pixel (`gpu_fill_known`), and by
+    /// making its outline otherwise, after which it is known.
+    fn draw_known(
+        &mut self,
+        mode: &str,
+        kind: u64,
+        dims: &[f64],
+        at: (f64, f64),
+        build: impl FnOnce(&mut Self),
+    ) -> Result<(), String> {
+        let t = self.st.transform;
+        let line = match mode {
+            "fill" => Some(false),
+            "line" => Some(true),
+            _ => None,
+        };
+        // Only where the same asking gives the same coverage: on the GPU,
+        // through a transform that moves and scales.
+        let simple = self.on_gpu() && t.b == 0.0 && t.c == 0.0 && t.a > 0.0 && t.d > 0.0;
+        let named = line.filter(|_| simple).map(|line| {
+            // On a grid of 256ths of a pixel, as outlines are told apart.
+            let grid = |v: f64| (v * 256.0).round() as i64 as u64;
+            let (px, py) = t.apply(at.0, at.1);
+            let anchor = (px.floor(), py.floor());
+            let mix = |hash: u64, value: u64| {
+                (hash.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95)
+            };
+            let mut hash = mix(kind, u64::from(line));
+            for value in [grid(px - anchor.0), grid(py - anchor.1), t.a.to_bits(), t.d.to_bits()] {
+                hash = mix(hash, value);
+            }
+            for &measure in dims {
+                hash = mix(hash, grid(measure));
+            }
+            if line {
+                hash = mix(hash, self.st.line_width.to_bits());
+                hash = mix(hash, self.st.line_join as u64);
+            }
+            (hash, (anchor.0 as i64, anchor.1 as i64))
+        });
+        if let Some((known, anchor)) = named {
+            let paint = self.paint();
+            if self.gpu_fill_known(known, anchor, &paint) == Some(true) {
+                return Ok(());
+            }
+        }
+        self.kept_whole = None;
+        build(self);
+        self.draw_local_path(mode, true)?;
+        if let (Some((known, anchor)), Some(whole)) = (named, self.kept_whole.take()) {
+            // Not without end: a shape that moves by parts of a pixel is a
+            // new one at each, and is found by its outline all the same.
+            if self.known.len() >= MOST_KNOWN {
+                self.known.clear();
+            }
+            self.known.insert(
+                known,
+                mirror::Known {
+                    dx: whole.dx - anchor.0,
+                    dy: whole.dy - anchor.1,
+                    ..whole
+                },
+            );
+        }
+        Ok(())
     }
 
     /// A large `rectangle("fill", …)` with rounded corners drawn in pieces:
@@ -670,8 +762,10 @@ impl Renderer {
             Some(n) => return Err(format!("segment count must be at least 3, got {n}")),
             None => self.segments_for(rx.abs().max(ry.abs())),
         };
-        geom::ellipse_path_into(x, y, rx, ry, segs, &mut self.scratch.local);
-        self.draw_local_path(mode, true)
+        let dims = [rx, ry, segs as f64];
+        self.draw_known(mode, 2, &dims, (x, y), |r| {
+            geom::ellipse_path_into(x, y, rx, ry, segs, &mut r.scratch.local);
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

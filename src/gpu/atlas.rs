@@ -16,6 +16,11 @@ use glow::HasContext;
 pub(crate) const BORDER: usize = 2;
 
 const START: usize = 512;
+/// As large as an atlas is ever made, where the chip takes textures that
+/// large; on one that does not (2048 a side on Intel's third generation)
+/// the chip's own limit, asked for when the atlas is made. Grown past
+/// what the chip takes, an atlas could not be made anew at all, and
+/// nothing more was ever kept in it.
 const LARGEST: usize = 4096;
 
 /// Which glyph: its font (slot and tag, so a released font's glyphs are
@@ -25,6 +30,9 @@ pub(crate) type GlyphKey = (u64, char);
 pub(crate) struct Atlas {
     pub(crate) texture: glow::Texture,
     pub(crate) size: usize,
+    /// The largest it may grow to: [`LARGEST`], or less on a chip whose
+    /// textures stop short of that.
+    largest: usize,
     /// Where each glyph is: the corner of its pixels (inside the border).
     places: HashMap<GlyphKey, (usize, usize)>,
     /// The shelf being filled: its top, how far along it is, and its height.
@@ -36,9 +44,12 @@ pub(crate) struct Atlas {
 impl Atlas {
     pub(crate) fn new(gl: &glow::Context) -> Result<Atlas, String> {
         let texture = make_texture(gl, START)?;
+        // SAFETY: a GL call on the current context.
+        let limit = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) };
         Ok(Atlas {
             texture,
             size: START,
+            largest: usize::try_from(limit).map_or(START, |limit| limit.clamp(START, LARGEST)),
             places: HashMap::new(),
             shelf_y: 0,
             shelf_x: 0,
@@ -72,13 +83,13 @@ impl Atlas {
             return Some((at, false));
         }
         let (cw, ch) = (w + 2 * BORDER, h + 2 * BORDER);
-        if cw > LARGEST || ch > LARGEST {
+        if cw > self.largest || ch > self.largest {
             return None;
         }
         let mut emptied = false;
         if !self.fits(cw, ch) {
             // Bigger if it can be, else the same size, empty.
-            let size = if self.size < LARGEST { self.size * 2 } else { self.size };
+            let size = if self.size < self.largest { self.size * 2 } else { self.size };
             let texture = make_texture(gl, size).ok()?;
             self.delete(gl);
             self.texture = texture;

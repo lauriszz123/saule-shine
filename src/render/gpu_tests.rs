@@ -301,6 +301,61 @@ const SCENES: &[(&str, Scene)] = &[
         }
         Ok(())
     }),
+    ("the same small shapes again and again, moved and cut", |r| {
+        backdrop(r);
+        // The first of each is kept in the atlas by its outline; the rest
+        // are found there by what was asked for, at other whole pixels,
+        // in other colours, and cut by the scissor and the screen's edge.
+        for i in 0..6 {
+            let (x, y) = (6.0 + f64::from(i) * 27.0, 8.0 + f64::from(i) * 3.0);
+            r.set_color(0.9, 0.2 + f64::from(i) * 0.1, 0.3, 0.8);
+            r.rectangle("fill", x, y, 22.0, 16.0, 5.0, 5.0)?;
+            r.set_color(1.0, 1.0, 1.0, 0.6);
+            r.rectangle("line", x, y, 22.0, 16.0, 5.0, 5.0)?;
+            r.set_color(0.2, 0.7, 0.9, 1.0);
+            r.circle("fill", x + 11.0, y + 34.0, 7.0, None)?;
+            r.circle("line", x + 11.0, y + 34.0, 9.0, None)?;
+        }
+        // At another part of a pixel they are other shapes.
+        r.set_color(0.3, 0.9, 0.4, 1.0);
+        r.rectangle("fill", 10.5, 70.25, 22.0, 16.0, 5.0, 5.0)?;
+        r.rectangle("fill", 40.5, 70.25, 22.0, 16.0, 5.0, 5.0)?;
+        r.set_scissor(Some((70.0, 66.0, 60.0, 14.0)));
+        for i in 0..4 {
+            let x = 62.0 + f64::from(i) * 20.0;
+            r.set_color(0.9, 0.8, 0.2, 0.9);
+            r.rectangle("fill", x, 60.0, 22.0, 16.0, 5.0, 5.0)?;
+            r.rectangle("line", x, 72.0, 22.0, 16.0, 5.0, 5.0)?;
+            r.circle("fill", x + 4.0, 80.0, 7.0, None)?;
+        }
+        r.set_scissor(None);
+        // Scaled, and hanging off the screen.
+        r.push(false);
+        r.scale(1.5, 1.5);
+        for i in 0..3 {
+            r.set_color(0.8, 0.3, 0.9, 1.0);
+            r.rectangle("fill", -6.0 + f64::from(i) * 50.0, 64.0, 22.0, 16.0, 5.0, 5.0)?;
+            r.rectangle("line", -6.0 + f64::from(i) * 50.0, 64.0, 22.0, 16.0, 5.0, 5.0)?;
+        }
+        r.pop()?;
+        Ok(())
+    }),
+    ("the same words again and again, moved and cut", |r| {
+        backdrop(r);
+        for i in 0..5 {
+            r.set_color(1.0, 1.0 - f64::from(i) * 0.15, 0.6, 1.0 - f64::from(i) * 0.15);
+            r.print("Saule AV fj Wo", 3.0 + f64::from(i) * 9.0, 2.0 + f64::from(i) * 15.0)?;
+        }
+        r.set_scissor(Some((30.0, 84.0, 90.0, 9.0)));
+        r.set_color(1.0, 1.0, 1.0, 1.0);
+        r.print("Saule AV fj Wo", 20.0, 80.0)?;
+        r.set_scissor(Some((0.0, 100.0, 47.0, 20.0)));
+        r.print("Saule AV fj Wo", 4.0, 100.0)?;
+        r.set_scissor(None);
+        // Off the left and the top of the screen.
+        r.print("Saule AV fj Wo", -20.0, 108.0)?;
+        r.print("Saule AV fj Wo", 100.0, -6.0)
+    }),
     ("text: plain, faded and coloured", |r| {
         backdrop(r);
         r.set_color(1.0, 1.0, 1.0, 1.0);
@@ -607,4 +662,81 @@ fn a_capture_is_what_was_on_the_target_made_to_fit() {
         assert!(left[1] > 250 && left[0] == 255, "gpu {gpu}: {left:?}");
         assert!(right[1] < 5 && right[0] == 255, "gpu {gpu}: {right:?}");
     }
+}
+
+/// How long a frame of an ordinary window takes to hand to the GPU: cards,
+/// key caps, lines of text and icons, as a page of Settings has them.
+/// Not a test: `cargo test --release -- --ignored --nocapture a_frame_of`,
+/// and under Mesa's i915 on a pretended GMA 3150 (Saule Linux's
+/// `gen3check/shine.sh`), where the corners of every shape are worked out
+/// by the processor and their number is what a frame costs.
+#[test]
+#[ignore]
+fn a_frame_of_a_window_timed() {
+    let Ok(device) = Device::headless() else {
+        eprintln!("skipped: no GPU");
+        return;
+    };
+    eprintln!("on {}", device.description);
+    let device = Rc::new(device);
+    let mut r = Renderer::headless(720, 480);
+    r.attach_gpu_always(Rc::clone(&device));
+    let frame = |r: &mut Renderer, shift: f64| -> Result<(), String> {
+        r.set_scissor(None);
+        r.clear(Some((0.13, 0.13, 0.15, 1.0)));
+        // The sidebar: nine icons and names.
+        r.set_color(0.10, 0.10, 0.12, 1.0);
+        r.rectangle("fill", 0.0, 0.0, 204.0, 480.0, 0.0, 0.0)?;
+        for i in 0..9 {
+            let y = 14.0 + f64::from(i) * 32.0;
+            r.set_color(0.25, 0.5, 0.9, 1.0);
+            r.rectangle("fill", 18.0, y, 22.0, 22.0, 6.0, 6.0)?;
+            r.circle("fill", 29.0, y + 11.0, 6.0, None)?;
+            r.set_color(0.9, 0.9, 0.9, 1.0);
+            r.print("Desktop & Windows", 46.0, y + 3.0)?;
+        }
+        // The pane, scrolled: five cards of rows, each a name and keys.
+        r.set_scissor(Some((208.0, 40.0, 512.0, 440.0)));
+        for card in 0..5 {
+            let top = 60.0 + f64::from(card) * 120.0 - shift;
+            r.set_color(1.0, 1.0, 1.0, 0.06);
+            r.rectangle("fill", 228.0, top, 472.0, 104.0, 10.0, 10.0)?;
+            for row in 0..3 {
+                let y = top + 8.0 + f64::from(row) * 32.0;
+                r.set_color(0.92, 0.92, 0.92, 1.0);
+                r.print("Open the launcher", 242.0, y + 4.0)?;
+                for key in 0..3 {
+                    let x = 590.0 + f64::from(key) * 32.0;
+                    r.set_color(1.0, 1.0, 1.0, 0.10);
+                    r.rectangle("fill", x, y, 28.0, 20.0, 5.0, 5.0)?;
+                    r.set_color(1.0, 1.0, 1.0, 0.30);
+                    r.rectangle("line", x, y, 28.0, 20.0, 5.0, 5.0)?;
+                    r.set_color(0.9, 0.9, 0.9, 1.0);
+                    r.print("Ctrl", x + 3.0, y + 3.0)?;
+                }
+                r.set_color(1.0, 1.0, 1.0, 0.08);
+                r.rectangle("fill", 242.0, y + 27.0, 444.0, 1.0, 0.0, 0.0)?;
+            }
+        }
+        r.set_scissor(None);
+        Ok(())
+    };
+    let end = |device: &Device| {
+        crate::gpu::batch::flush(device);
+        // SAFETY: a GL call on the device's current context.
+        unsafe { glow::HasContext::flush(&device.gl) };
+    };
+    // Twice first: glyphs and shapes take their places in the atlases.
+    for _ in 0..2 {
+        frame(&mut r, 0.0).expect("a frame");
+        end(&device);
+    }
+    let frames = std::env::var("SHINE_FRAMES").ok().and_then(|n| n.parse().ok()).unwrap_or(300);
+    let began = std::time::Instant::now();
+    for i in 0..frames {
+        frame(&mut r, f64::from(i % 40) * 3.0).expect("a frame");
+        end(&device);
+    }
+    let took = began.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
+    eprintln!("a frame: {took:.3} ms");
 }

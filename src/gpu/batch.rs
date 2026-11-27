@@ -20,6 +20,16 @@ use crate::raster::BlendMode;
 /// flags (2).
 const FLOATS: usize = 16;
 
+/// The most squares in one draw: their corners are numbered in sixteen
+/// bits (`Device::squares`). A run longer than this is drawn in parts.
+///
+/// A square is its four corners, and which three of them make each of its
+/// triangles is said once, for every square there will ever be. Sent as
+/// two triangles of three corners each, a third of what went to the chip
+/// was said twice; and on a chip that leaves each corner to the processor
+/// (see `Renderer::gpu_text_kept`) a third of a frame's drawing was that.
+pub(crate) const MOST: usize = 8192;
+
 #[derive(Default)]
 pub(crate) struct Batch {
     /// Where the run draws: the target's framebuffer and size.
@@ -60,6 +70,12 @@ pub(crate) fn add(dst: &Texture, blend: BlendMode, quad: &Quad) {
         batch.target = Some((framebuffer, dst.w, dst.h));
         batch.blend = Some(blend);
     }
+    if dev.batch.borrow().vertices.len() >= MOST * 4 * FLOATS {
+        flush(dev);
+        let mut batch = dev.batch.borrow_mut();
+        batch.target = Some((framebuffer, dst.w, dst.h));
+        batch.blend = Some(blend);
+    }
     let mut batch = dev.batch.borrow_mut();
     let (x0, y0, x1, y1) = quad.area;
     let [r, g, b, a] = quad.colour;
@@ -68,7 +84,7 @@ pub(crate) fn add(dst: &Texture, blend: BlendMode, quad: &Quad) {
         if quad.mask.is_some() { 1.0 } else { 0.0 },
         if quad.antialias { 1.0 } else { 0.0 },
     ];
-    for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x0, y1), (x1, y0), (x1, y1)] {
+    for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
         batch.vertices.extend_from_slice(&[x, y]);
         batch.vertices.extend_from_slice(&quad.rect);
         // Red and blue swapped, as the textures hold them.
@@ -115,11 +131,13 @@ pub(crate) fn flush(dev: &Device) {
             gl.enable_vertex_attrib_array(location);
             gl.vertex_attrib_pointer_f32(location, size, glow::FLOAT, false, stride, offset * 4);
         }
-        gl.draw_arrays(glow::TRIANGLES, 0, (batch.vertices.len() / FLOATS) as i32);
+        let squares = batch.vertices.len() / FLOATS / 4;
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(dev.squares));
+        gl.draw_elements(glow::TRIANGLES, (squares * 6) as i32, glow::UNSIGNED_SHORT, 0);
         for location in 1..5 {
             gl.disable_vertex_attrib_array(location);
         }
     }
-    crate::trace::batched((batch.vertices.len() / FLOATS / 6) as u32);
+    crate::trace::batched((batch.vertices.len() / FLOATS / 4) as u32);
     batch.vertices.clear();
 }

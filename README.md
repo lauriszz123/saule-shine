@@ -65,8 +65,14 @@ Two halves, deliberately:
   (`SHINE_GPU_DRAW=1` draws through OpenGL even where it is only Mesa on
   the CPU, which on the bare screen Shine otherwise passes over for its
   own, faster drawing). A window inside a Shine display server draws on
-  the CPU when the server does, and on Intel's oldest chips (GMA 900 to
-  3150), where OpenGL on no surface is not to be trusted.
+  the GPU too, and on the CPU where the only OpenGL is Mesa's software
+  one or `SHINE_APP_GPU=0` says so. On Intel's oldest chips (GMA 900 to
+  3150) it does so on trial (`gpu/trial.rs`): a program that ends before
+  it has shown a few frames has every program after it draw on the CPU,
+  until the machine is started again. `SHINE_GPU_TRIAL=1` puts any chip
+  on trial. `SHINE_TRACE_FRAMES=1` says every two seconds where a
+  program's frames spend their time, and which drawing calls most of an
+  average frame's drawing went to.
   `Graphics.getRenderer()` is the chip the bare screen is drawn by, as it
   names itself, or "" when the CPU draws, and then
   `Graphics.getRendererProblem()` is why: which step of starting OpenGL

@@ -67,6 +67,19 @@ pub(crate) enum Which {
     Canvas(usize),
 }
 
+/// A shape whose coverage the shape atlas holds whole: under which key,
+/// and its box, counted from the pixel the shape was asked at (as a
+/// thing known by what was asked for) or from the target's corner (as
+/// `gpu_fill_kept` reports the one it has just filled).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Known {
+    pub(crate) key: (u64, char),
+    pub(crate) dx: i64,
+    pub(crate) dy: i64,
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+}
+
 impl Renderer {
     /// Draw on `dev` from now on, where an operation can.
     pub(crate) fn attach_gpu(&mut self, dev: Rc<Device>) {
@@ -593,7 +606,17 @@ impl Renderer {
 
         let dev = Rc::clone(&self.gpu.as_ref()?.dev);
         // Where in the atlas, and the target pixel its first texel is for.
+        // For whoever asked for this shape by name (`draw_known`): where
+        // its coverage is kept whole, if it is by the end of this.
+        let as_whole = Known {
+            key: whole_key,
+            dx: bx0 as i64,
+            dy: by0 as i64,
+            w: bw,
+            h: bh,
+        };
         let (corner, origin) = if let Some(corner) = gpu::kept_shape(&dev, whole_key) {
+            self.kept_whole = Some(as_whole);
             (corner, (bx0 as i64, by0 as i64))
         } else {
             let (key, cut) = if keep_whole {
@@ -642,7 +665,12 @@ impl Renderer {
                     match (found, kept) {
                         (None, _) => return Some(true),
                         (Some(_), None) => return None,
-                        (Some(_), Some(corner)) => (corner, origin),
+                        (Some(_), Some(corner)) => {
+                            if keep_whole {
+                                self.kept_whole = Some(as_whole);
+                            }
+                            (corner, origin)
+                        }
                     }
                 }
             }
@@ -682,6 +710,9 @@ impl Renderer {
         if self.sync_gpu(target, false).is_err() {
             return false;
         }
+        if let Some(drawn) = self.gpu_text_kept(paint, placed, target) {
+            return drawn;
+        }
         let key = self.font_key();
         let Some(font) = self.fonts[self.st.font].value.as_ref() else {
             return false;
@@ -716,6 +747,248 @@ impl Renderer {
             self.touched_gpu(target);
         }
         drawn
+    }
+
+    /// Fill a shape the atlas holds whole, found by what was asked for
+    /// (`known`, from `draw_known`) with no outline made at all: `anchor`
+    /// is the pixel the shape was asked at, which its box is counted from.
+    /// `None` when it is not held, or cannot be drawn so, and the caller
+    /// makes the outline and fills that.
+    ///
+    /// A shape is otherwise known by its outline (`gpu_fill_kept`): made
+    /// point by point, stroked if it is a line, moved to the screen and
+    /// hashed, for every key cap and icon of every frame, to find coverage
+    /// the atlas has had since the first. That was more than half of what
+    /// a frame cost the processor once the chip had the drawing.
+    pub(crate) fn gpu_fill_known(
+        &mut self,
+        known: u64,
+        anchor: (i64, i64),
+        paint: &Paint,
+    ) -> Option<bool> {
+        if !self.on_gpu() || !gpu::can_fill(paint.blend) || paint.gradient.is_some() {
+            return None;
+        }
+        let Known { key, dx, dy, w: bw, h: bh } = *self.known.get(&known)?;
+        let dev = Rc::clone(&self.gpu.as_ref()?.dev);
+        // Gone when the atlas was made anew: kept again the long way.
+        let corner = gpu::kept_shape(&dev, key)?;
+
+        let (w, h) = self.target_size();
+        let clip = paint.clip.intersect(&Rect::surface(w, h));
+        if clip.is_empty() {
+            return Some(true);
+        }
+        let origin = (anchor.0 + dx, anchor.1 + dy);
+        let place = Rect {
+            x0: origin.0 as f64,
+            y0: origin.1 as f64,
+            x1: (origin.0 + bw as i64) as f64,
+            y1: (origin.1 + bh as i64) as f64,
+        };
+        // Cut by a scissor that is not on whole pixels: not this way.
+        let whole =
+            place.x0 >= clip.x0 && place.y0 >= clip.y0 && place.x1 <= clip.x1 && place.y1 <= clip.y1;
+        let on_pixels = |v: f64| v.fract() == 0.0;
+        if !whole && !(on_pixels(clip.x0) && on_pixels(clip.y0) && on_pixels(clip.x1) && on_pixels(clip.y1)) {
+            return None;
+        }
+        let (ax0, ay0, ax1, ay1) = place.intersect(&clip).pixel_bounds(w, h);
+        if ax0 >= ax1 || ay0 >= ay1 {
+            return Some(true);
+        }
+        let target = self.which_target();
+        self.prepare_target(target);
+        if self.sync_gpu(target, false).is_err() {
+            return None;
+        }
+        let texture = self.texture(target)?;
+        let fill = gpu::Fill {
+            colour: paint.color,
+            gradient: None,
+            antialias: paint.antialias,
+            blend: paint.blend,
+            area: gpu::Clip { x0: ax0, y0: ay0, x1: ax1, y1: ay1 },
+        };
+        if !gpu::fill(texture, &fill, gpu::Cover::Kept { origin, corner }) {
+            return None;
+        }
+        self.touched_gpu(target);
+        Some(true)
+    }
+
+    /// Draw a run of glyphs that all stand on whole pixels (nearly all text
+    /// does) as one shape from the shape atlas: the run's coverage, put
+    /// together from its glyphs' the first time that run is drawn, and a
+    /// single square from then on, which joins the batch with the
+    /// rectangles around it. `None` when the run is not such a one, or is
+    /// too large to keep, and is drawn glyph by glyph.
+    ///
+    /// A glyph each was a square each, six corners, in a draw of its own
+    /// for every line of text, which also ended the batch of shapes before
+    /// it. On a chip that leaves the corners to the processor (Intel's up
+    /// to the third generation: Mesa works each one out in an interpreter)
+    /// the corners are what a frame costs, about twenty microseconds each
+    /// on an Atom, and a page of text is a few thousand of them: a window
+    /// drew slower on that chip than without it.
+    ///
+    /// A run is known by its font, its characters and where each stands
+    /// from the run's corner, so the same words anywhere are the same
+    /// shape. Where two glyphs overlap, their coverage is joined as two
+    /// opaque layers would be: exact for opaque text, and a shade off in
+    /// those few pixels for text drawn faded.
+    ///
+    /// It is kept the second time it is drawn. The first time each glyph
+    /// goes into the batch by itself, from the same atlas, where a glyph
+    /// is kept once however many runs it is in: text that is new every
+    /// time it is drawn (a clock's seconds, a meter's numbers) would
+    /// otherwise fill the atlas with runs nothing asks for again, and an
+    /// atlas that is full is emptied, shapes and all.
+    fn gpu_text_kept(
+        &mut self,
+        paint: &Paint,
+        placed: &[(char, Transform)],
+        target: Which,
+    ) -> Option<bool> {
+        /// The largest run kept, in pixels: a long line, or a paragraph.
+        const MOST: usize = 128 * 1024;
+        /// Marks a run's key among the shape atlas's (1 and 2 are shapes').
+        const RUN: char = '\u{3}';
+        /// Runs remembered as drawn once, before they are forgotten.
+        const MOST_SEEN: usize = 8192;
+
+        let font = self.fonts[self.st.font].value.as_ref()?;
+        // Each glyph's place and size, and the box they fill together.
+        let mut boxes: Vec<(char, i64, i64, usize, usize)> = Vec::with_capacity(placed.len());
+        let (mut bx0, mut by0, mut bx1, mut by1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        for (ch, t) in placed {
+            let (ox, oy) = raster::axis_aligned_offset(t)?;
+            let Some(glyph) = font.glyph(*ch) else {
+                continue;
+            };
+            let (gw, gh) = (glyph.mask.w, glyph.mask.h);
+            if gw == 0 || gh == 0 {
+                continue;
+            }
+            boxes.push((*ch, ox, oy, gw, gh));
+            bx0 = bx0.min(ox);
+            by0 = by0.min(oy);
+            bx1 = bx1.max(ox + gw as i64);
+            by1 = by1.max(oy + gh as i64);
+        }
+        if boxes.is_empty() {
+            return Some(true);
+        }
+        let (bw, bh) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
+        if bw.checked_mul(bh).is_none_or(|area| area > MOST) {
+            return None;
+        }
+
+        // The pixels of it to draw: its box, within the scissor.
+        let (w, h) = self.target_size();
+        let seen = Rect {
+            x0: bx0 as f64,
+            y0: by0 as f64,
+            x1: bx1 as f64,
+            y1: by1 as f64,
+        }
+        .intersect(&paint.clip);
+        let (ax0, ay0, ax1, ay1) = seen.pixel_bounds(w, h);
+        if ax0 >= ax1 || ay0 >= ay1 {
+            return Some(true);
+        }
+
+        // Not the standard hasher: this is done for every line of text of
+        // every frame, and nothing here is an adversary's to choose.
+        let mix = |hash: u64, value: u64| (hash.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+        let mut hash = mix(0x9e37_79b9_7f4a_7c15, self.font_key());
+        for &(ch, ox, oy, _, _) in &boxes {
+            hash = mix(hash, u64::from(ch));
+            hash = mix(hash, ((ox - bx0) as u64) << 32 | (oy - by0) as u64);
+        }
+        let key = (hash, RUN);
+
+        let dev = Rc::clone(&self.gpu.as_ref()?.dev);
+        let paint_area = |x0, y0, x1, y1| gpu::Fill {
+            colour: paint.color,
+            gradient: None,
+            antialias: true,
+            blend: paint.blend,
+            area: gpu::Clip { x0, y0, x1, y1 },
+        };
+        let corner = match gpu::kept_shape(&dev, key) {
+            Some(corner) => corner,
+            // The first time: glyph by glyph. A glyph is a shape by its
+            // font and character; one whose character is a mark of the
+            // atlas's own has no glyph worth the doubt.
+            None if !self.runs_seen.contains(&hash) => {
+                if boxes.iter().any(|&(ch, ..)| ch <= RUN) {
+                    return None;
+                }
+                let font_key = self.font_key();
+                let texture = self.texture(target)?;
+                for &(ch, ox, oy, gw, gh) in &boxes {
+                    let glyph = font.glyph(ch)?;
+                    let one = (font_key, ch);
+                    let corner = match gpu::kept_shape(&dev, one) {
+                        Some(corner) => corner,
+                        None => gpu::keep_shape(&dev, one, &glyph.mask.data, gw, gh)?,
+                    };
+                    let place = Rect {
+                        x0: ox as f64,
+                        y0: oy as f64,
+                        x1: (ox + gw as i64) as f64,
+                        y1: (oy + gh as i64) as f64,
+                    }
+                    .intersect(&paint.clip);
+                    let (x0, y0, x1, y1) = place.pixel_bounds(w, h);
+                    if x0 >= x1 || y0 >= y1 {
+                        continue;
+                    }
+                    let cover = gpu::Cover::Kept { origin: (ox, oy), corner };
+                    if !gpu::fill(texture, &paint_area(x0, y0, x1, y1), cover) {
+                        return None;
+                    }
+                }
+                if self.runs_seen.len() >= MOST_SEEN {
+                    self.runs_seen.clear();
+                }
+                self.runs_seen.insert(hash);
+                self.touched_gpu(target);
+                return Some(true);
+            }
+            None => {
+                self.runs_seen.remove(&hash);
+                let mut mask = std::mem::take(&mut self.scratch.mask);
+                mask.clear();
+                mask.resize(bw * bh, 0);
+                for &(ch, ox, oy, gw, gh) in &boxes {
+                    let Some(glyph) = font.glyph(ch) else {
+                        continue;
+                    };
+                    let (left, top) = ((ox - bx0) as usize, (oy - by0) as usize);
+                    for row in 0..gh {
+                        let from = &glyph.mask.data[row * gw..row * gw + gw];
+                        let at = (top + row) * bw + left;
+                        for (into, &cover) in mask[at..at + gw].iter_mut().zip(from) {
+                            let (had, more) = (u32::from(*into), u32::from(cover));
+                            *into = (had + more - raster::div255(had * more)) as u8;
+                        }
+                    }
+                }
+                let kept = gpu::keep_shape(&dev, key, &mask, bw, bh);
+                self.scratch.mask = mask;
+                kept?
+            }
+        };
+        let fill = paint_area(ax0, ay0, ax1, ay1);
+        let origin = (bx0, by0);
+        let texture = self.texture(target)?;
+        if !gpu::fill(texture, &fill, gpu::Cover::Kept { origin, corner }) {
+            return None;
+        }
+        self.touched_gpu(target);
+        Some(true)
     }
 
     /// Draw `frame` of canvas `idx` onto the target through `xform`, on the

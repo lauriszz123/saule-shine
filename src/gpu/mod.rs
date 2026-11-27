@@ -41,6 +41,8 @@ mod present;
 mod program;
 pub(crate) mod shader;
 mod texture;
+#[cfg(target_os = "linux")]
+pub(crate) mod trial;
 
 use glow::HasContext;
 
@@ -120,9 +122,9 @@ pub(crate) fn drawing_forced() -> bool {
 /// Intel's graphics chips up to the third generation (the 8xx, 915, 945,
 /// G33 and Atom "Pineview" families: GMA 900 to 3150), by PCI device id.
 /// Their OpenGL stops at ES 2 with a few dozen instructions a shader, and
-/// its driver is the least exercised Mesa has. Apps are kept off it until
-/// it is known to work: on a GMA 3150, the one such chip tried, no app
-/// stayed open while trying the GPU was the default.
+/// its driver is the least exercised Mesa has. Apps draw on one on trial
+/// ([`trial`]): on a GMA 3150, the one such chip tried, no app stayed
+/// open the first time the GPU was their default.
 const OLD_INTEL: [u16; 21] = [
     0x3577, 0x2562, 0x3582, 0x358e, 0x2572, 0x2582, 0x258a, 0x2592, 0x2772, 0x27a2, 0x27ae,
     0x29b2, 0x29c2, 0x29d2, 0xa001, 0xa011, 0x2776, 0x27a6, 0x2782, 0x2792, 0xa002,
@@ -133,17 +135,21 @@ pub(crate) fn old_intel(vendor: u16, device: u16) -> bool {
     vendor == 0x8086 && OLD_INTEL.contains(&device)
 }
 
-/// Whether an app inside a display server may draw on the GPU, with a
-/// context on no surface: not on a machine whose graphics chip is an old
-/// Intel one (see [`OLD_INTEL`]), where Shine's own CPU drawing is what
-/// works. `SHINE_GPU_DRAW=1` asks for the GPU all the same.
+/// Whether an app inside a display server draws on the GPU on trial
+/// ([`trial`]): on a machine whose graphics chip is an old Intel one (see
+/// [`OLD_INTEL`]), or when `SHINE_GPU_TRIAL=1` says so of any chip, which
+/// is how the trial itself is tried. `SHINE_GPU_DRAW=1` asks for the GPU
+/// outright, with no trial.
 #[cfg(target_os = "linux")]
-pub(crate) fn headless_trusted() -> bool {
+pub(crate) fn headless_on_trial() -> bool {
     if drawing_forced() {
+        return false;
+    }
+    if std::env::var_os("SHINE_GPU_TRIAL").is_some_and(|v| v == "1") {
         return true;
     }
     let Ok(devices) = std::fs::read_dir("/sys/bus/pci/devices") else {
-        return true;
+        return false;
     };
     let hex = |text: String| u16::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
     for entry in devices.flatten() {
@@ -154,10 +160,18 @@ pub(crate) fn headless_trusted() -> bool {
         if let (Some(vendor), Some(device)) = (hex(read("vendor")), hex(read("device")))
             && old_intel(vendor, device)
         {
-            return false;
+            return true;
         }
     }
-    true
+    false
+}
+
+/// Whether the programs a display server shows were told to draw on the
+/// CPU while it draws on the GPU itself (`SHINE_APP_GPU=0`): the way out
+/// for a chip whose driver runs the desktop and not what is in it.
+#[cfg(target_os = "linux")]
+pub(crate) fn apps_kept_off() -> bool {
+    std::env::var_os("SHINE_APP_GPU").is_some_and(|v| v == "0")
 }
 
 /// Have the programs this one starts draw on the CPU: what a display

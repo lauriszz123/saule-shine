@@ -6,6 +6,14 @@
 //! shine: 31 fps · frame 32.1 ms = draw 11.0 + present 2.4 + program 18.7 (+ idle 0.0)
 //! ```
 //!
+//! followed, when an average frame drew for a fifth of a millisecond or
+//! more, by where that drawing went (the `Graphics` functions, the time
+//! in each a frame and the calls of each a frame):
+//!
+//! ```text
+//! shine 71:   drawn a frame · graphics.rs:116 9.80 ms in 59 · graphics.rs:212 1.10 ms in 36
+//! ```
+//!
 //! - **draw**: inside Shine's drawing calls (`Graphics.*` on the renderer);
 //! - **present**: putting the frame on screen, or sending it to the display
 //!   server;
@@ -110,7 +118,15 @@ thread_local! {
     /// Shapes whose coverage the CPU worked out in this frame, and the
     /// pixels of them: what the GPU's shape atlas is there to avoid.
     static FRAME_MASKS: Cell<(u32, u64)> = const { Cell::new((0, 0)) };
+    /// The drawing since the last two-second line, by which `Graphics`
+    /// function it was: what an ordinary frame's drawing goes to, where
+    /// `FRAME_CALLS` is only told of for a frame that froze.
+    static SPAN_CALLS: RefCell<Calls> = RefCell::new(HashMap::new());
 }
+
+/// A two-second line says where the drawing went when an average frame
+/// drew for at least this long.
+const WORTH_NAMING: f64 = 0.2;
 
 /// A single drawing call that takes this long is reported on its own.
 const SLOW_CALL: Duration = Duration::from_millis(30);
@@ -138,12 +154,14 @@ pub(crate) fn drawing<R>(caller: &'static std::panic::Location<'static>, f: impl
         t.set(v);
     });
     FRAME_DRAW.with(|d| d.set(d.get() + took));
-    FRAME_CALLS.with(|calls| {
-        let mut calls = calls.borrow_mut();
-        let entry = calls.entry((caller.file(), caller.line())).or_default();
-        entry.0 += took;
-        entry.1 += 1;
-    });
+    for calls in [&FRAME_CALLS, &SPAN_CALLS] {
+        calls.with(|calls| {
+            let mut calls = calls.borrow_mut();
+            let entry = calls.entry((caller.file(), caller.line())).or_default();
+            entry.0 += took;
+            entry.1 += 1;
+        });
+    }
     out
 }
 
@@ -235,6 +253,23 @@ pub(crate) fn frame(present: Duration, idle: Duration) {
             std::process::id(),
             n / span.as_secs_f64()
         ));
+        // And what an average frame's drawing went to, when it drew for
+        // long enough to ask: the functions, the time in each a frame and
+        // the calls of each a frame.
+        let mut calls: Vec<_> = SPAN_CALLS.with(|c| c.borrow_mut().drain().collect());
+        if draw >= WORTH_NAMING {
+            calls.sort_by_key(|&(_, (took, _))| std::cmp::Reverse(took));
+            let mut most = String::new();
+            for ((file, line), (took, count)) in calls.into_iter().take(5) {
+                let file = file.rsplit('/').next().unwrap_or(file);
+                most.push_str(&format!(
+                    " · {file}:{line} {:.2} ms in {:.0}",
+                    ms(took),
+                    f64::from(count) / n
+                ));
+            }
+            report(&format!("shine {}:   drawn a frame{most}", std::process::id()));
+        }
         v = ZERO;
         SINCE.with(|s| s.set(Some(now)));
     }

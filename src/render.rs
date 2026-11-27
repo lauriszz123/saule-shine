@@ -72,6 +72,14 @@ pub struct Renderer {
     /// The GPU, and the surfaces' textures on it, while drawing goes there
     /// (see `mirror`): `None` draws everything on the CPU.
     pub(crate) gpu: Option<GpuState>,
+    /// Shapes the shape atlas holds whole, by what was asked for (a
+    /// rounded rectangle of this size at this part of a pixel), and the
+    /// one the last fill kept so: see `mirror::Known`.
+    pub(crate) known: std::collections::HashMap<u64, mirror::Known>,
+    pub(crate) kept_whole: Option<mirror::Known>,
+    /// Runs of text drawn once on the GPU and not yet kept whole: see
+    /// `Renderer::gpu_text_kept`.
+    pub(crate) runs_seen: std::collections::HashSet<u64>,
 }
 
 impl Renderer {
@@ -95,6 +103,9 @@ impl Renderer {
             linear_filter: true,
             scratch: Scratch::default(),
             gpu: None,
+            known: std::collections::HashMap::new(),
+            kept_whole: None,
+            runs_seen: std::collections::HashSet::new(),
         }
     }
 

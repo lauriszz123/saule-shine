@@ -184,6 +184,10 @@ pub(crate) struct Client {
     wheel: (f64, f64),
     /// The GPU the renderer draws with, when there is one.
     gpu: Option<std::rc::Rc<crate::gpu::Device>>,
+    /// The chip's trial, while this program is one (`gpu::trial`): until
+    /// it has handed a few frames over.
+    #[cfg(target_os = "linux")]
+    trial: Option<crate::gpu::trial::Trial>,
     /// Frames handed over as GPU buffers the server shares (see
     /// `present_shared`): the two buffers, which one is next, and whether
     /// sharing is still worth trying (the server or the driver may refuse,
@@ -243,6 +247,10 @@ impl Client {
             )
             .map_err(|e| fail(&e))?;
         let id = reply.first().and_then(int).ok_or_else(|| fail(&"no window id came back"))?;
+        #[cfg(target_os = "linux")]
+        let (gpu, trial) = headless_gpu();
+        #[cfg(not(target_os = "linux"))]
+        let gpu = headless_gpu();
         Ok(Client {
             looper,
             conn,
@@ -250,7 +258,9 @@ impl Client {
             input,
             frame: None,
             wheel: (0.0, 0.0),
-            gpu: headless_gpu(),
+            gpu,
+            #[cfg(target_os = "linux")]
+            trial,
             #[cfg(target_os = "linux")]
             shared: None,
             #[cfg(target_os = "linux")]
@@ -444,6 +454,27 @@ impl Client {
     }
 }
 
+impl Client {
+    /// [`Backend::present_texture`]'s two ways, shared and read back.
+    #[cfg(target_os = "linux")]
+    fn present_drawn(&mut self, texture: &crate::gpu::Texture) -> Result<bool, String> {
+        if self.share {
+            match self.present_shared(texture) {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    if crate::gpu::tracing() {
+                        eprintln!("shine: frames can't be shared ({e}); sending pixels");
+                    }
+                    self.share = false;
+                    self.shared = None;
+                }
+            }
+        }
+        self.send(texture.w, texture.h, |frame| texture.read_bytes(frame))?;
+        Ok(true)
+    }
+}
+
 impl Backend for Client {
     fn is_open(&self) -> bool {
         self.input.open
@@ -528,20 +559,16 @@ impl Backend for Client {
     /// into the shared memory, with no stop in the CPU's copy of the screen.
     fn present_texture(&mut self, texture: &crate::gpu::Texture) -> Result<bool, String> {
         #[cfg(target_os = "linux")]
-        if self.share {
-            match self.present_shared(texture) {
-                Ok(()) => return Ok(true),
-                Err(e) => {
-                    if crate::gpu::tracing() {
-                        eprintln!("shine: frames can't be shared ({e}); sending pixels");
-                    }
-                    self.share = false;
-                    self.shared = None;
-                }
-            }
+        let shown = self.present_drawn(texture);
+        #[cfg(not(target_os = "linux"))]
+        let shown = self.send(texture.w, texture.h, |frame| texture.read_bytes(frame)).map(|()| true);
+        // A frame the chip drew has been handed over: enough of them and
+        // its trial is passed.
+        #[cfg(target_os = "linux")]
+        if shown.is_ok() && self.trial.as_mut().is_some_and(|trial| trial.frame()) {
+            self.trial = None;
         }
-        self.send(texture.w, texture.h, |frame| texture.read_bytes(frame))?;
-        Ok(true)
+        shown
     }
 
     fn keys_down(&self) -> Vec<Key> {
@@ -669,30 +696,65 @@ impl Drop for Client {
     }
 }
 
-/// A GPU to draw on, if drawing on the GPU is wanted and one starts.
+/// A GPU to draw on, if drawing on the GPU is wanted and one starts; and
+/// the chip's trial, when this program is one (`gpu::trial`).
 #[cfg(target_os = "linux")]
-fn headless_gpu() -> Option<std::rc::Rc<crate::gpu::Device>> {
+fn headless_gpu() -> (
+    Option<std::rc::Rc<crate::gpu::Device>>,
+    Option<crate::gpu::trial::Trial>,
+) {
+    use crate::gpu::trial::{self, Trial};
+
     if !crate::gpu::drawing_wanted() {
-        return None;
+        return (None, None);
     }
-    if !crate::gpu::headless_trusted() {
+    if crate::gpu::apps_kept_off() {
         if crate::gpu::tracing() {
-            eprintln!("shine: an old Intel graphics chip; drawing on the CPU");
+            eprintln!("shine: programs are kept off the GPU (SHINE_APP_GPU=0); drawing on the CPU");
         }
-        return None;
+        return (None, None);
     }
+    let on_trial = crate::gpu::headless_on_trial();
+    if on_trial && trial::failed(&trial::folder()) {
+        // Said whether or not anything is being traced: it is why every
+        // program on this machine is slower than it might be.
+        eprintln!(
+            "shine: a program that drew on this graphics chip ended before it showed anything; \
+             drawing on the CPU"
+        );
+        return (None, None);
+    }
+    let trial = on_trial.then(|| Trial::begin(&trial::folder())).flatten();
     match crate::gpu::Device::headless() {
+        // Mesa drawing on the CPU is no GPU, here as on the bare screen:
+        // it is far slower than Shine's own drawing. A display server
+        // that found only that says so to what it starts, but a program
+        // started for it by something else (Saule Linux's init) was
+        // never told, and took it.
+        Ok(dev)
+            if !crate::gpu::drawing_forced() && crate::gpu::software_renderer(&dev.description) =>
+        {
+            if crate::gpu::tracing() {
+                eprintln!(
+                    "shine: only Mesa's software OpenGL to draw on ({}); drawing on the CPU",
+                    dev.description
+                );
+            }
+            (None, None)
+        }
         Ok(dev) => {
             if crate::gpu::tracing() {
-                eprintln!("shine: drawing on the GPU: {}", dev.description);
+                let how = if on_trial { " (on trial)" } else { "" };
+                eprintln!("shine: drawing on the GPU{how}: {}", dev.description);
             }
-            Some(std::rc::Rc::new(dev))
+            (Some(std::rc::Rc::new(dev)), trial)
         }
         Err(e) => {
             if crate::gpu::tracing() {
                 eprintln!("shine: no GPU to draw on ({e}); drawing on the CPU");
             }
-            None
+            // The chip refused in order: nothing ended badly.
+            (None, None)
         }
     }
 }
